@@ -37,7 +37,7 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FOnMovementCapabilityChanged OnMovementCapabilityChanged;
 
-	/** Toggle debug logging for behavior state changes (editor only). */
+	/** Log behavior changes in editor builds. */
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	bool bShowDebug = false;
 };

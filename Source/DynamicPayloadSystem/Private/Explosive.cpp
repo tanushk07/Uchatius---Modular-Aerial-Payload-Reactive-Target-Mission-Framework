@@ -23,10 +23,8 @@ AExplosive::AExplosive()
 
 	ExplosionVFX = CreateDefaultSubobject<UNiagaraComponent>(TEXT("ExplosionFX"));
 	ExplosionVFX->SetupAttachment(RootComponent);
-	// UNiagaraComponent defaults to bAutoActivate=true — without disabling it,
-	// the FX plays at spawn time before Explode() and again on the explicit
-	// Activate() in PlayExplosionEffects, or it plays at all for editor-placed
-	// explosives that have bExplodeOnBeginPlay=false.
+	// Niagara components auto-activate by default. Keep the effect inactive
+	// until detonation.
 	ExplosionVFX->SetAutoActivate(false);
 }
 
@@ -50,8 +48,7 @@ void AExplosive::BeginPlay()
 
 void AExplosive::Explode()
 {
-	// Re-entry guard — Explode is BlueprintCallable and could be invoked twice
-	// (BeginPlay + manual BP call, or two damage reactions).
+	// Prevent duplicate detonations from BeginPlay, Blueprint, or damage events.
 	if (bHasDetonated)
 	{
 		return;
@@ -75,7 +72,20 @@ void AExplosive::Explode()
 	}
 
 	PlayExplosionEffects();
-	SetLifeSpan(DestroyDelay_s);
+
+	// The sound is attached to us and dies with us, so stick around until it's
+	// done - otherwise a short DestroyDelay would cut the bang off.
+	float LifeSpan = DestroyDelay_s;
+	if (ExplosionSound)
+	{
+		// Looping sounds report a huge duration; don't hang around for those.
+		const float SoundLength = ExplosionSound->GetDuration();
+		if (SoundLength < 60.f)
+		{
+			LifeSpan = FMath::Max(LifeSpan, SoundLength + 0.1f);
+		}
+	}
+	SetLifeSpan(LifeSpan);
 }
 
 TArray<FOverlapResult> AExplosive::ScanForTargets() const
@@ -91,9 +101,7 @@ TArray<FOverlapResult> AExplosive::ScanForTargets() const
 	Params.AddObjectTypesToQuery(ECC_PhysicsBody);
 	Params.AddObjectTypesToQuery(ECC_Pawn);
 	Params.AddObjectTypesToQuery(ECC_WorldDynamic);
-	// WorldStatic so destructible buildings/cover that use the static channel
-	// can take blast damage. Without this, a bunker with a UDamagableComponent
-	// is invisible to the overlap query.
+	// Include WorldStatic so bunkers/cover with a DamagableComponent get hit too.
 	Params.AddObjectTypesToQuery(ECC_WorldStatic);
 
 	World->OverlapMultiByObjectType(
@@ -144,9 +152,7 @@ void AExplosive::ApplyDamageToActors(const TArray<FOverlapResult>& Overlaps)
 
 		if (FinalDamage > MinDamageToApply)
 		{
-			// InstigatorController (rather than nullptr) so kill credit, AI
-			// perception, and scoring systems can attribute the damage to the
-			// pawn that originally dropped the payload.
+			// Pass the instigator controller for kill attribution and scoring.
 			UGameplayStatics::ApplyDamage(
 				HitActor,
 				FinalDamage,
@@ -198,9 +204,8 @@ float AExplosive::CalculateFinalDamage(AActor* Victim, const FVector& ExplosionP
 
 	const FVector ToTarget = ClosestPoint - ExplosionPos;
 	const float DirectionalFactor = ComputeDirectionalFactor(ToTarget);
-	// Pass Victim so the trace ignores the target's own collision — otherwise
-	// the line ends on the target's hull, reports "blocked", and every visible
-	// target silently gets 0.3x damage.
+	// Ignore the victim so the trace does not hit its own collision and reduce
+	// clear-line-of-sight damage to 0.3x.
 	const float VisibilityFactor = HasLineOfSight(ClosestPoint, Victim) ? 1.f : 0.3f;
 
 	const float BlastDamage =
@@ -214,12 +219,18 @@ float AExplosive::CalculateFinalDamage(AActor* Victim, const FVector& ExplosionP
 
 void AExplosive::PlayExplosionEffects()
 {
+	// Attached, not fire-and-forget. A loose one-shot can't be stopped, so if
+	// the game paused mid-bang and you hit Retry, it just finished playing
+	// after the unpause. Attached to us, it goes away when we do.
 	if (ExplosionSound)
 	{
-		UGameplayStatics::PlaySoundAtLocation(
-			this,
+		UGameplayStatics::SpawnSoundAttached(
 			ExplosionSound,
-			GetActorLocation()
+			GetRootComponent(),
+			NAME_None,
+			FVector::ZeroVector,
+			EAttachLocation::KeepRelativeOffset,
+			/*bStopWhenAttachedToDestroyed=*/ true
 		);
 	}
 	if (ExplosionVFX && ExplosionVFX->GetAsset())
@@ -227,7 +238,7 @@ void AExplosive::PlayExplosionEffects()
 		ExplosionVFX->Activate(true);
 	}
 
-	// Camera shake: if user assigned a CameraShake class on the Blueprint, trigger it automatically
+	// Play the assigned camera shake, if any.
 	if (CameraShake)
 	{
 		UGameplayStatics::PlayWorldCameraShake(
@@ -239,7 +250,7 @@ void AExplosive::PlayExplosionEffects()
 		);
 	}
 
-	// Broadcast delegate for game code to react with custom logic
+	// Notify listeners of the explosion.
 	OnExplosionTriggered.Broadcast(GetActorLocation(), ExplosionRadius_m);
 }
 
@@ -256,7 +267,7 @@ bool AExplosive::HasLineOfSight(const FVector& TargetPoint, const AActor* Ignore
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		// Defensive: assume visible if no world (only reachable during teardown).
+		// Treat the target as visible when no world is available, such as during teardown.
 		return true;
 	}
 

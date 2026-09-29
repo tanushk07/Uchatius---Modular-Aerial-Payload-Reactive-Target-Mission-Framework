@@ -34,8 +34,8 @@ protected:
 	UPROPERTY()
 	APayloadMissionManager* CachedMissionManager = nullptr;
 
-	/** If true, the armed payload detonates on physical contact with any actor
-	 *  that has a UDamagableComponent (in addition to the fuse timer). */
+	/** Detonate on contact with an actor that has a DamagableComponent, in
+	 *  addition to the fuse timer. */
 	UPROPERTY(EditAnywhere, Category = "Explosion")
 	bool bExplodeOnHit = false;
 
@@ -59,7 +59,7 @@ public:
 		const FHitResult& Hit
 	);
 
-	/** Toggle debug logging for payload arm/fuse/impact events (editor only). */
+	/** Enable debug logging for arming, fuse, and impact events. */
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	bool bShowDebug = false;
 };

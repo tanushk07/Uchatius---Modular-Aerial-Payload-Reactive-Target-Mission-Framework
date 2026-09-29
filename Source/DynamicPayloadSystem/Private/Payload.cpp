@@ -91,9 +91,8 @@ void APayload::Arm()
 
 	if (bExplodeOnHit)
 	{
-		// Explicit so hit events work regardless of project-level collision
-		// profile customisation. The PhysicsActor profile usually sets this,
-		// but we don't want to rely on that.
+		// Set it ourselves so hit events work even if someone changed the collision
+		// profiles. PhysicsActor normally has it on, but I'd rather not count on that.
 		PayloadMesh->SetNotifyRigidBodyCollision(true);
 		PayloadMesh->OnComponentHit.AddDynamic(
 			this, &APayload::OnPayloadHit

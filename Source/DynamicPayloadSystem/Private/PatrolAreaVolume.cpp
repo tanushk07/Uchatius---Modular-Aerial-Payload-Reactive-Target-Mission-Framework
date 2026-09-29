@@ -25,9 +25,8 @@ FVector APatrolAreaVolume::GetRandomPointInArea() const
 	const FVector Origin = Bounds->GetComponentLocation();
 	const FVector Extent = Bounds->GetScaledBoxExtent();
 
-	// Z is intentionally the volume centre — ground-based patrols zero the
-	// callsite's Z anyway, and the alternative (randomising Z too) wastes
-	// entropy and produces unreachable waypoints for ground vehicles.
+	// Keep points at the volume's Z coordinate. Ground vehicles ignore height,
+	// and varying Z can produce unreachable points.
 	return FVector(
 		Origin.X + FMath::FRandRange(-Extent.X, Extent.X),
 		Origin.Y + FMath::FRandRange(-Extent.Y, Extent.Y),

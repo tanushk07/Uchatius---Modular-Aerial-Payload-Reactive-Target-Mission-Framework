@@ -9,7 +9,7 @@ public class DynamicPayloadSystem : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-		// Strict include-what-you-use. Replaces the deprecated/removed bEnforceIWYU flag.
+		// Strict include-what-you-use (replaces the old bEnforceIWYU flag).
 		IWYUSupport = IWYUSupport.Full;
 
 		PublicIncludePaths.AddRange(new string[]

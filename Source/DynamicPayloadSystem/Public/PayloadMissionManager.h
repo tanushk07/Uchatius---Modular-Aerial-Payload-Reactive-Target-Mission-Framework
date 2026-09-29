@@ -19,13 +19,8 @@ enum class EPayloadMissionState : uint8
 	Failed
 };
 
-/**
- * What a mission target looked like before anyone shot at it.
- *
- * A destroyed target despawns (DamagableComponent::DestroyDelay), so a retry
- * cannot simply revive what is left in the world - the actor is gone. Recording
- * the class and the starting transform is what makes rebuilding it possible.
- */
+/** A target as it was before anyone started shooting at it.
+ *  The class and start transform are kept so a reset can put it back. */
 USTRUCT()
 struct FMissionTargetSnapshot
 {
@@ -37,8 +32,7 @@ struct FMissionTargetSnapshot
 	UPROPERTY()
 	FTransform SpawnTransform = FTransform::Identity;
 
-	/** Weak on purpose: this is the actor that may have despawned, and holding
-	 *  a hard reference would keep a destroyed target alive in memory. */
+	/** Weak so a dead target isn't kept alive just by being referenced here. */
 	UPROPERTY()
 	TWeakObjectPtr<AActor> LiveActor;
 };
@@ -104,24 +98,44 @@ protected:
 	UPROPERTY()
 	TArray<FGameLogEntry> PendingMissionLogs;
 
-	/** The original line-up, recorded the first time a mission starts and reused
-	 *  by every subsequent reset. Never re-captured from a world that has
-	 *  already been fought over, or each retry would bake in the last one's
-	 *  losses and the mission would get quietly easier every time. */
+	/** Every level ATargetActor, captured once after BeginPlay and reused for
+	 *  subsequent resets. */
 	UPROPERTY()
 	TArray<FMissionTargetSnapshot> MissionTargetSnapshots;
+
+	bool bTargetSnapshotCaptured = false;
+
+	/** Capture level targets once. Subsequent calls have no effect. */
+	void CaptureLevelTargets();
+
+	/** Revive snapshotted targets and restore their initial transforms. */
+	void ResetTargetsToStart();
+
+	/** Removes blasts and falling payloads left over from the last attempt. */
+	void ClearLeftoversFromLastAttempt();
+
+	/** Clear mission state, timers, and target bindings without resetting the world. */
+	void TeardownMission();
+
+	/** Handle possession of a new pawn, which may indicate a new game session. */
+	UFUNCTION()
+	void OnPlayerPossessedPawnChanged(APawn* OldPawn, APawn* NewPawn);
+
+	/** Run one tick after possession, once the game mode flag has been updated. */
+	void HandleNewSessionStarted();
+
+	/** Prevent the manager's pawn reset from being handled as a new session. */
+	bool bResettingPlayer = false;
 
 	UPROPERTY()
 	FTransform PlayerRestartTransform = FTransform::Identity;
 
-	/** Captured at mission start so the drone can be REBUILT, not just moved.
-	 *  A kamikaze destroys the pawn outright, so on retry there is nothing left
-	 *  to teleport - the class is the only way back. */
+	/** Kamikaze deletes the drone, so on retry there's nothing to teleport.
+	 *  Keeping the class means a new one can be spawned. */
 	UPROPERTY()
 	TSubclassOf<APawn> CapturedPlayerPawnClass;
 
-	/** Payload setup carried over to the replacement drone, so a respawn does
-	 *  not silently discard what the configuration screen injected. */
+	/** Whatever the config screen set up, so the respawned drone gets it too. */
 	UPROPERTY()
 	TSubclassOf<class APayload> CapturedPayloadClass;
 
@@ -135,10 +149,8 @@ protected:
 	/** Teleports the player pawn home and clears its physics state. */
 	void ResetPlayerToStart();
 
-	/** Per-instance "we've already warned about this" flag. Was a function-static
-	 *  bool previously, which persisted across PIE sessions — so devs who fixed
-	 *  the HUD-implements-interface issue would never see the diagnostic again
-	 *  in subsequent PIE sessions even if the issue regressed. */
+	/** Warn-once flag for the HUD interface check. It used to be a static bool,
+	 *  so the warning only ever showed in the first PIE session. */
 	bool bWarnedAboutMissingInterface = false;
 
 public:
@@ -152,24 +164,15 @@ public:
 		EPayloadMissionState, NewState
 	);
 
-	/** Fires for each second of the pre-mission countdown, starting at
-	 *  CountdownStartTime and ending at 1.
-	 *
-	 *  The countdown exists so the world settles and the player can orient
-	 *  before the clock starts, but it used to be invisible: this is what lets
-	 *  a UI draw "3, 2, 1" over it, and what tells game code when to lock the
-	 *  player's input.
-	 *
-	 *  Zero is deliberately never broadcast - the mission begins on that beat.
-	 *  Bind OnMissionStateChanged for the "GO" moment and it will land exactly
-	 *  as control returns, with no dead second in between. */
+	/** Fires once per second of the pre-mission countdown (3, 2, 1...).
+	 *  There's no 0 - for "GO" listen to OnMissionStateChanged, which fires as
+	 *  the mission starts. */
 	DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 		FOnMissionCountdown,
 		int32, SecondsRemaining
 	);
 
-	/** Broadcast once when the mission resolves (Success or Failed). Carries the
-	 *  end-of-mission summary so a results screen can display it without polling. */
+	/** Fires once when the mission ends, win or lose, with the stats for a results screen. */
 	DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
 		FOnMissionResolved,
 		EPayloadMissionState, FinalState,
@@ -193,9 +196,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Mission")
 	void NotifyAttemptConsumed();
 
-	/** Register a target that came into existence after StartMission ran.
-	 *  Safe to call from anywhere — guarded against double-registration and
-	 *  silently ignores calls outside of the InProgress state. */
+	/** For targets spawned after the mission started. Calling it twice is fine,
+	 *  and it does nothing if no mission is running. */
 	UFUNCTION(BlueprintCallable, Category = "Mission")
 	void RegisterMissionTarget(class ATargetActor* Target);
 
@@ -229,14 +231,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Mission")
 	void RetryMission();
 
-	/**
-	 * Put the world back the way it was when the mission first started:
-	 * every target alive and intact at its original transform, every vehicle
-	 * returned to its start with movement state cleared, and the player back
-	 * at the PlayerStart with no leftover velocity.
-	 *
-	 * Idempotent - calling it twice in a row is harmless.
-	 */
+	/** Puts everything back: targets revived at their start, vehicles back on
+	 *  their route, and a fresh drone at the PlayerStart. Safe to call twice. */
 	UFUNCTION(BlueprintCallable, Category = "Mission")
 	void ResetMissionWorld();
 
@@ -270,36 +266,21 @@ public:
 	FTimerHandle LastPayloadResolveTimerHandle;
 	void DeferredResolveLastPayload();
 
-	/**
-	 * Hard upper bound (seconds) on how long the mission may sit in the
-	 * "waiting for the last payload" state before it is force-resolved.
-	 * This is a safety backstop: the normal resolution path
-	 * (NotifyLastPayloadResolved -> DeferredResolveLastPayload) should
-	 * almost always fire first. The watchdog only matters when the last
-	 * payload leaves play through a path that never calls back into the
-	 * mission manager (Blueprint Destroy, owning pawn destroyed, level
-	 * streaming, EndPlay during travel, pooling/reuse, etc.). Set this
-	 * comfortably ABOVE the longest realistic payload flight + fuse time
-	 * so it never pre-empts a legitimate resolution.
-	 */
+	/** Safety net, in seconds. If the last payload disappears without reporting
+	 *  back (destroyed from BP, drone died, level unloaded) the mission would wait
+	 *  forever. After this long it resolves anyway. Keep it longer than a
+	 *  payload's fall plus fuse time, or it will cut in early. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mission",
 		meta = (ClampMin = "1.0"))
 	float LastPayloadWatchdogTimeout = 10.0f;
 	FTimerHandle LastPayloadWatchdogHandle;
 
-	/**
-	 * Spawns/attaches a payload on the first actor that actually has a
-	 * UPayloadAttachmentComponent. Centralizes the carrier lookup so the
-	 * "iterate, test for the component, then stop" logic exists in exactly
-	 * one place (the previous inline loops broke out of the iterator after
-	 * the first actor regardless of whether it had the component, so they
-	 * only worked by luck of actor iteration order).
-	 * @return true if a carrier was found and SpawnAndAttachPayload() ran.
-	 */
+	/** Gives a payload to whoever is carrying - the player's drone first,
+	 *  otherwise the first actor with a PayloadAttachmentComponent.
+	 *  @return false if there was nobody to give it to. */
 	bool SpawnPayloadOnCarrier();
 
-	/** Enters the "waiting for last payload" state from a single place:
-	 *  sets flags, freezes the timer, and arms the watchdog. */
+	/** Out of attempts but a payload might still be falling - wait for it. */
 	void EnterWaitingForLastPayload();
 
 	/** Arms (or re-arms) the watchdog timer. */

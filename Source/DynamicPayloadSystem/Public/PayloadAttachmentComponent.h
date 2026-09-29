@@ -34,15 +34,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Payload")
 	bool bAutoSpawnOnBeginPlay = false;
 
-	/** Kamikaze mode: owner explodes payload on collision with damageable target */
+	/** Enable kamikaze detonation when the carrier collides with a target. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Payload")
 	bool bKamikazeMode = false;
 
-	/** Name of the child mesh component used as kamikaze trigger (e.g. "CopperPin") */
+	/** Name of the child mesh used as the kamikaze trigger (e.g. "CopperPin"). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Payload", meta = (EditCondition = "bKamikazeMode"))
 	FName KamikazeTriggerMeshName = TEXT("CopperPin");
 
-	/** Minimum speed (m/s) for kamikaze explosion to trigger */
+	/** Minimum speed in m/s required to trigger a kamikaze detonation. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Payload", meta = (EditCondition = "bKamikazeMode", ClampMin = "0"))
 	float MinKamikazeSpeed_ms = 5.0f;
 
@@ -73,7 +73,7 @@ public:
 
 	// ================= Events =================
 
-	/** Fired when payload is attached or detached. Game code can react (e.g. update UI, adjust physics). */
+	/** Broadcast when a payload is attached or detached. */
 	UPROPERTY(BlueprintAssignable, Category = "Payload")
 	FOnPayloadStateChanged OnPayloadStateChanged;
 
@@ -112,16 +112,8 @@ public:
 protected:
 	virtual void BeginPlay() override;
 
-	/** Takes a still-attached payload down with the carrier.
-	 *
-	 *  A payload is attached to the drone, not owned by it, so destroying the
-	 *  drone used to leave the charge floating in the world. Anything that
-	 *  replaces the pawn - a mission retry, or returning to the menu and
-	 *  pressing Play again - leaked one payload actor per cycle.
-	 *
-	 *  A DROPPED payload is deliberately left alone: DetachPayload clears
-	 *  AttachedPayload, so a charge already in flight still lands and explodes
-	 *  even if the drone that released it is gone. */
+	/** Destroy the attached payload when the drone ends play. Dropped payloads
+	 *  are no longer attached and remain in the world. */
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	UFUNCTION()
@@ -133,12 +125,8 @@ protected:
 		bool bFromSweep,
 		const FHitResult& SweepResult);
 
-	/** Kamikaze detection for BLOCKING contact.
-	 *
-	 *  The drone root ships on the PhysicsActor profile and the targets are
-	 *  WorldDynamic, and the two block each other. A blocking pair produces a
-	 *  Hit, never an Overlap, so overlap alone could never see a drone ram a
-	 *  truck. Both are bound; whichever the collision setup produces wins. */
+	/** Handle blocking contact. Blocking collision pairs generate hit events,
+	 *  while overlap events are handled separately. */
 	UFUNCTION()
 	void OnKamikazeHit(
 		UPrimitiveComponent* HitComp,
@@ -147,29 +135,20 @@ protected:
 		FVector NormalImpulse,
 		const FHitResult& Hit);
 
-	/** Shared gate + detonation for both contact paths.
-	 *  @return true if the kamikaze actually fired. */
+	/** Validate contact and trigger detonation for overlap and hit events.
+	 *  @return True if detonation occurred. */
 	virtual void TickComponent(
 		float DeltaTime,
 		ELevelTick TickType,
 		FActorComponentTickFunction* ThisTickFunction) override;
 
-	/** Shared body of both contact handlers.
-	 *
-	 *  OtherComp matters: a target's collision is not only its hull. Decoration
-	 *  such as a floating health widget is query-only and can sit metres away
-	 *  from the vehicle, so judging on OtherActor alone detonates the payload
-	 *  near the target rather than on it. Pass the component that actually
-	 *  registered the contact; nullptr skips the solidity test. */
+	/** Shared contact validation. OtherComp identifies the component that
+	 *  registered the contact; nullptr skips the collision solidity check. */
 	bool TryKamikazeDetonate(AActor* OtherActor, UPrimitiveComponent* OtherComp);
 
-	/** Finds the trigger mesh and binds contact events.
-	 *
-	 *  Called unconditionally, NOT gated on bKamikazeMode. The flag is set from
-	 *  the configuration screen long after BeginPlay has run, so binding only
-	 *  when it was already true meant kamikaze was never armed at all. The
-	 *  handlers re-check the flag at contact time, which is where the decision
-	 *  actually belongs. Safe to call more than once. */
+	/** Find the trigger mesh and bind contact events. Always bind during
+	 *  initialization because the kamikaze setting may be enabled later. The
+	 *  handlers check the setting when contact occurs. Safe to call repeatedly. */
 	void RefreshKamikazeBinding();
 
 	bool bKamikazeBindingDone = false;

@@ -320,13 +320,13 @@ FrontTraceOffset=600, RearTraceOffset=600, GroundAlignInterpSpeed=2, TraceHeight
 
 ---
 
-## Testing Guide & Demo Map
+## Testing Guide & Demo Project
 
-A reference demo map ships under `Content/Demos/DemoMap.umap` and exercises every public-facing feature. The walkthrough below describes both **what the demo map contains** and **how to verify each system works**. Use it for smoke-testing after upgrades, or as a starting template for your own integration.
+The plugin ZIP contains the plugin only; it does not include the demo project or its sample assets. Download the separate demo project from the Demo Project link in the Fab listing description, enable this plugin in that project, and use its demo map to exercise the features. The paths below refer to assets in the demo project.
 
-### What the demo map contains
+### Demo project assets
 
-| Actor / Asset | Path in plugin | Purpose |
+| Actor / Asset | Path in demo project | Purpose |
 |---|---|---|
 | `BP_DemoDrone` | `Content/Demos/Pawns/` | Pawn with `UPayloadAttachmentComponent`, camera, flight input |
 | `BP_DemoPayload` | `Content/Demos/Payloads/` | `APayload` subclass — fuse 3s, references `BP_DemoExplosive` |
@@ -451,17 +451,9 @@ For each test, the **Expected** column tells you what success looks like. If you
 
 ---
 
-### Migrating the demo map into the plugin
+### Demo project download
 
-After you've built the demo map in your test project, ship it with the plugin so other users get the same starting point.
-
-1. **Right-click `Content/Demos/DemoMap` in the test project** → Asset Actions → Migrate.
-2. UE walks the dependency tree and shows everything the map references (textures, meshes, materials, the BP classes).
-3. **Set destination** to `D:/UE_5.8/Engine/Plugins/Marketplace/DynamicPayloadSystem/Content/Demos/`.
-4. UE copies all dependencies and rewrites references to the plugin paths.
-5. Verify by opening a *new* project, enabling the plugin, and opening `/DynamicPayloadSystem/Demos/DemoMap` from the Content Browser.
-
-**Important:** anything migrated into the plugin's `Content/` becomes part of the FAB submission. Don't migrate engine-bundled or third-party-bundled assets — strip them out before migration (use cleaner pass: `File → Migrate` lets you exclude branches of the dependency tree).
+The demo project is distributed separately from this plugin ZIP. Use the Demo Project link in the Fab listing description to download it; its maps and sample assets are not part of the plugin archive.
 
 ---
 

@@ -8,8 +8,7 @@ void AMissionLogHUD::PushGameLog_Implementation(const FGameLogEntry& Entry)
 	{
 		LogHistory.Add(Entry);
 
-		// Trim from the front so the newest entries survive. Unbounded growth
-		// here would be a slow leak across a long session.
+		// Remove the oldest entries to keep history bounded.
 		const int32 Excess = LogHistory.Num() - MaxLogHistory;
 		if (Excess > 0)
 		{

@@ -31,8 +31,7 @@ public:
 protected:
 	virtual void BeginPlay() override;
 
-	/** Re-entry guard. Explode() is BlueprintCallable, so Blueprint code can
-	 *  call it externally — without this guard, double-call applies damage twice. */
+	/** Prevent duplicate detonation; Explode() is BlueprintCallable. */
 	bool bHasDetonated = false;
 
 	/* ================= Root & FX ================= */
@@ -59,9 +58,7 @@ protected:
 
 	float CalculateFinalDamage(AActor* Victim, const FVector& ExplosionPos);
 	float ComputeDirectionalFactor(const FVector& ToTarget) const;
-	/** Trace from this actor's location to TargetPoint, ignoring this actor and
-	 *  optionally an additional actor (typically the victim, so the trace doesn't
-	 *  self-hit the target's collision when the endpoint is on its surface). */
+	/** Trace to TargetPoint, ignoring this actor and an optional additional actor. */
 	bool HasLineOfSight(const FVector& TargetPoint, const AActor* IgnoreActor = nullptr) const;
 
 	/* ================= Unit Conversion ================= */
@@ -72,6 +69,9 @@ protected:
 	}
 
 public:
+
+	/** Has this one already gone off? */
+	bool HasDetonated() const { return bHasDetonated; }
 
 	/* ================= Explosion Parameters (SI) ================= */
 
@@ -86,12 +86,11 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Explosion|SI",
 		meta = (ClampMin = "0.1",
-			ToolTip = "Seconds the actor lives after detonation. Must outlast your Niagara FX or the VFX will pop."))
+			ToolTip = "Seconds the actor remains after detonation. Set this longer than the Niagara effect duration."))
 	float DestroyDelay_s = 3.0f;
 
-	/** If true, detonates automatically on BeginPlay. Disabled by default so designers
-	 *  can preview/place explosives in a level without them firing. APayload sets this
-	 *  to true on spawned instances. */
+	/** Detonate on BeginPlay. Disabled by default for level-placed explosives;
+	 *  APayload enables it for spawned instances. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Explosion")
 	bool bExplodeOnBeginPlay = false;
 
@@ -100,9 +99,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Damage|SI")
 	float MaxDamage = 10.0f;
 
-	/** Damage values below this threshold are not applied. Prevents spamming
-	 *  ApplyDamage with sub-noise values for distant targets. Was a hard-coded
-	 *  1.0 before — now configurable. */
+	/** Damage below this threshold is not applied. */
 	UPROPERTY(EditAnywhere, Category = "Damage|SI",
 		meta = (ClampMin = "0.0"))
 	float MinDamageToApply = 1.0f;
@@ -118,7 +115,7 @@ public:
 
 	/* ================= Camera Shake ================= */
 
-	/** Optional camera shake class. If set, triggers automatically via PlayWorldCameraShake. */
+	/** Optional camera shake, played automatically. */
 	UPROPERTY(EditAnywhere, Category = "Explosion|Camera")
 	TSubclassOf<UCameraShakeBase> CameraShake;
 
@@ -127,13 +124,13 @@ public:
 
 	/* ================= Debug ================= */
 
-	/** Toggle debug draw for explosion radii (editor only). */
+	/** Debug draw for the blast radii (editor only). */
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	bool bShowDebug = false;
 
 	/* ================= Events ================= */
 
-	/** Broadcast when this explosive detonates. Game code can subscribe for custom reactions. */
+	/** Broadcast when detonation is triggered. */
 	UPROPERTY(BlueprintAssignable, Category = "Explosion")
 	FOnExplosionTriggered OnExplosionTriggered;
 };

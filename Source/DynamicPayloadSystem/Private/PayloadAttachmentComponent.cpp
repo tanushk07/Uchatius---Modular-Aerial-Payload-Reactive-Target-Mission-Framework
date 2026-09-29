@@ -14,9 +14,8 @@
 
 UPayloadAttachmentComponent::UPayloadAttachmentComponent()
 {
-	// Ticks only to re-test an overlap that is already in progress - see
-	// TickComponent. Enabled unconditionally because bKamikazeMode is switched
-	// on by game code long after construction.
+	// Tick to recheck existing overlaps. Kamikaze mode may be enabled after
+	// BeginPlay, so ticking remains enabled regardless of its initial value.
 	PrimaryComponentTick.bCanEverTick = true;
 }
 
@@ -24,15 +23,15 @@ void UPayloadAttachmentComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Cache mission manager reference once
+	// Cache the mission manager.
 	TActorIterator<APayloadMissionManager> MissionManagerIt(GetWorld());
 	if (MissionManagerIt)
 	{
 		CachedMissionManager = *MissionManagerIt;
 	}
 
-	// Always bind. bKamikazeMode is switched on by the configuration screen
-	// well after BeginPlay, so gating the binding on it armed nothing.
+	// Bind regardless of the initial setting because the configuration screen
+	// may enable kamikaze mode after BeginPlay.
 	RefreshKamikazeBinding();
 
 	if (bAutoSpawnOnBeginPlay && PayloadClass)
@@ -43,8 +42,7 @@ void UPayloadAttachmentComponent::BeginPlay()
 
 void UPayloadAttachmentComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// Only clean up a charge still riding on this carrier. One that was
-	// released has already been handed over to the world.
+	// Destroy the payload only while it remains attached to this actor.
 	if (AttachedPayload)
 	{
 		AttachedPayload->Destroy();
@@ -60,7 +58,7 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 	if (AttachedPayload || !PayloadClass)
 		return;
 
-	// Mission mode gate
+	// Check mission mode.
 	APayloadMissionManager* MissionManager = CachedMissionManager;
 
 	if (MissionManager && MissionManager->IsMissionSystemEnabled())
@@ -91,7 +89,7 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 	if (!AttachedPayload)
 		return;
 
-	// Configure fuse time from mission manager (if available)
+	// Use the configured mission fuse time when available.
 	if (MissionManager)
 	{
 		AttachedPayload->FuseTime = MissionManager->ConfiguredFuseTime;
@@ -110,7 +108,7 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 	PayloadMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	PayloadMesh->SetCollisionProfileName(TEXT("PhysicsActor"));
 
-	// Enable physics briefly to read mass
+	// Temporarily enable physics to read the payload mass.
 	PayloadMesh->SetSimulatePhysics(true);
 	CachedPayloadMass = PayloadMesh->GetMass();
 
@@ -119,7 +117,7 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 		CachedPayloadMass = 1.0f;
 	}
 
-	// Make owner and payload ignore each other's collision
+	// Prevent collisions between the drone and its attached payload.
 	OwnerRoot->IgnoreActorWhenMoving(AttachedPayload, true);
 	PayloadMesh->IgnoreActorWhenMoving(GetOwner(), true);
 	OwnerRoot->IgnoreComponentWhenMoving(PayloadMesh, true);
@@ -131,13 +129,13 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 
 	if (bEnableDanglingPhysics)
 	{
-		// DANGLING MODE: Use physics constraint — payload keeps simulating
+		// DANGLING: The payload simulates under a physics constraint.
 		PayloadMesh->SetEnableGravity(true);
 		CreatePhysicsConstraint();
 	}
 	else
 	{
-		// KINEMATIC MODE: Disable physics and attach as child
+		// KINEMATIC: attach without simulating physics.
 		PayloadMesh->SetSimulatePhysics(false);
 		PayloadMesh->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 		AttachedPayload->AttachToComponent(
@@ -146,7 +144,7 @@ void UPayloadAttachmentComponent::SpawnAndAttachPayload()
 		);
 	}
 
-	// Notify listeners (UI, custom physics, etc.)
+	// Notify listeners of the payload state change.
 	OnPayloadStateChanged.Broadcast(true);
 }
 
@@ -162,8 +160,8 @@ void UPayloadAttachmentComponent::CreatePhysicsConstraint()
 	if (!OwnerRoot || !PayloadMesh)
 		return;
 
-	// MakeUniqueObjectName so successive Spawn→Detach→Spawn cycles (mission retry,
-	// multi-attempt missions) don't collide on a static FName and assert in shipping.
+	// Generate a unique name for each instance to avoid reusing an FName across
+	// spawn and drop cycles.
 	const FName UniqueName = MakeUniqueObjectName(
 		GetOwner(), UPhysicsConstraintComponent::StaticClass(), TEXT("PayloadConstraint"));
 	PayloadConstraint = NewObject<UPhysicsConstraintComponent>(GetOwner(), UniqueName);
@@ -171,18 +169,16 @@ void UPayloadAttachmentComponent::CreatePhysicsConstraint()
 	PayloadConstraint->AttachToComponent(OwnerRoot, FAttachmentTransformRules::KeepRelativeTransform);
 	PayloadConstraint->SetRelativeLocation(FVector::ZeroVector);
 
-	// Ball-joint constraint
+	// Ball joint
 	PayloadConstraint->SetLinearXLimit(ELinearConstraintMotion::LCM_Locked, 0);
 	PayloadConstraint->SetLinearYLimit(ELinearConstraintMotion::LCM_Locked, 0);
 	PayloadConstraint->SetLinearZLimit(ELinearConstraintMotion::LCM_Locked, 0);
 
-	// Wire SwingAngleLimit (0..90) into the physics constraint so the editable
-	// UPROPERTY actually controls swing range.
-	// - SwingAngleLimit = 0  → constraint locked (no swing — kinematic-like behavior)
-	// - SwingAngleLimit > 0  → swing limited to ±SwingAngleLimit degrees from the
-	//   constraint's primary axis on both swing axes
-	// - Set to 90 to recover the original "essentially free" swing behavior.
-	// Twist is always free — a bomb's spin around its hanging axis isn't gameplay-relevant.
+	// SwingAngleLimit controls how far it can swing:
+	//   0      = locked (kinematic)
+	//   1..89  = swings up to that many degrees each way
+	//   90     = effectively unrestricted swing
+	// Twist remains unconstrained.
 	if (SwingAngleLimit > 0.f)
 	{
 		PayloadConstraint->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Limited, SwingAngleLimit);
@@ -225,10 +221,7 @@ void UPayloadAttachmentComponent::DetachPayload()
 	if (!OwnerRoot || !PayloadMesh)
 		return;
 
-	// Mirror everything SpawnAndAttachPayload set up. Previously only the two
-	// MoveIgnoreActors entries were cleared, which left the payload silently
-	// ignoring the owner's collision channel — meaning a dropped payload could
-	// fall through the drone that dropped it.
+	// Restore collision settings changed during attachment before detaching.
 	OwnerRoot->IgnoreActorWhenMoving(AttachedPayload, false);
 	PayloadMesh->IgnoreActorWhenMoving(GetOwner(), false);
 	OwnerRoot->IgnoreComponentWhenMoving(PayloadMesh, false);
@@ -236,8 +229,7 @@ void UPayloadAttachmentComponent::DetachPayload()
 
 	ECollisionChannel OwnerChannel = OwnerRoot->GetCollisionObjectType();
 	PayloadMesh->SetCollisionResponseToChannel(OwnerChannel, ECR_Block);
-	// We deliberately leave the camera channel as Ignore — a projectile
-	// blocking the player camera is undesirable in every scenario.
+	// Keep camera collision ignored so the payload does not obstruct the view.
 
 	if (bEnableDanglingPhysics)
 	{
@@ -255,7 +247,7 @@ void UPayloadAttachmentComponent::DetachPayload()
 	}
 	else
 	{
-		// Kinematic mode: detach and enable physics
+		// Kinematic: detach and turn physics on
 		FVector OwnerVelocity = OwnerRoot->GetComponentVelocity();
 		AttachedPayload->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
 		PayloadMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
@@ -271,10 +263,10 @@ void UPayloadAttachmentComponent::DetachPayload()
 
 	DetachedPayload->Arm();
 
-	// Notify listeners
+	// Notify listeners that the payload was detached.
 	OnPayloadStateChanged.Broadcast(false);
 
-	// Notify mission manager
+	// Notify the mission manager that the payload was dropped.
 	if (CachedMissionManager)
 	{
 		CachedMissionManager->NotifyAttemptConsumed();
@@ -310,19 +302,12 @@ void UPayloadAttachmentComponent::TickComponent(
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	// Re-arm a contact that is already happening.
-	//
-	// OnComponentBeginOverlap fires once, on entry. A trigger volume wide
-	// enough to be useful is crossed while still manoeuvring, so that single
-	// frame is usually below the speed threshold - and once the overlap has
-	// begun, no further event arrives however hard the target is then rammed.
-	// Re-testing here turns a one-shot into the continuous condition it was
-	// always meant to be.
+	// Recheck existing overlaps each tick. BeginOverlap fires only on entry, when
+	// the vehicle may still be below the kamikaze speed threshold.
 	if (!bKamikazeMode || !AttachedPayload || !KamikazeTriggerMesh)
 		return;
 
-	// Cheap gate first: below the threshold there is nothing to consider, and
-	// this runs every frame.
+	// Check speed before querying overlapping components.
 	const UPrimitiveComponent* OwnerRoot = GetOwnerRootMesh();
 	if (OwnerRoot &&
 		OwnerRoot->GetComponentVelocity().Size() / 100.0f < MinKamikazeSpeed_ms)
@@ -337,8 +322,7 @@ void UPayloadAttachmentComponent::TickComponent(
 		if (!Other)
 			continue;
 
-		// TryKamikazeDetonate destroys the owner on success, so stop touching
-		// anything the moment it reports a hit.
+		// Detonation may destroy the owner; stop processing overlaps immediately.
 		if (TryKamikazeDetonate(Other->GetOwner(), Other))
 			return;
 	}
@@ -367,8 +351,7 @@ void UPayloadAttachmentComponent::RefreshKamikazeBinding()
 		}
 	}
 
-	// Fall back to the root body rather than arming nothing. A misspelled or
-	// empty KamikazeTriggerMeshName used to disable kamikaze silently.
+	// Fall back to the root body if the configured trigger mesh is not found.
 	if (!KamikazeTriggerMesh)
 	{
 		KamikazeTriggerMesh = GetOwnerRootMesh();
@@ -384,14 +367,12 @@ void UPayloadAttachmentComponent::RefreshKamikazeBinding()
 
 	KamikazeTriggerMesh->SetGenerateOverlapEvents(true);
 
-	// Simulating bodies only report blocking contact when this is on, and it
-	// is off by default. Without it the Hit path below never fires either.
+	// Enable hit notifications for simulating bodies.
 	KamikazeTriggerMesh->SetNotifyRigidBodyCollision(true);
 
-	// A skeletal mesh does not simulate through its own BodyInstance - it
-	// simulates through the per-bone bodies of its physics asset, and the call
-	// above never reaches those. The drone's root is exactly this case, so
-	// without this the Hit path stays silent no matter what else is set.
+	// Skeletal meshes simulate through their physics asset bodies, not their own
+	// BodyInstance, so the call above doesn't reach them. The drone root is a
+	// skeletal mesh, so without this the hit events never come.
 	if (USkeletalMeshComponent* SkeletalTrigger = Cast<USkeletalMeshComponent>(KamikazeTriggerMesh))
 	{
 		SkeletalTrigger->SetAllBodiesNotifyRigidBodyCollision(true);
@@ -433,15 +414,9 @@ bool UPayloadAttachmentComponent::TryKamikazeDetonate(
 	if (!OtherActor || OtherActor == GetOwner())
 		return false;
 
-	// Only solid geometry counts as a strike. Targets routinely carry
-	// query-only decoration - health widgets, selection volumes, audio ranges -
-	// that overlaps the drone long before the hull does and can extend metres
-	// past the vehicle. Those used to detonate the payload in open air near the
-	// target, which read as the fuze going off at random.
-	//
-	// Physics collision is the discriminator: a hull has it, a UI widget does
-	// not. Checked here rather than in the handlers so the overlap and hit
-	// paths cannot diverge.
+	// Ignore query-only components such as health widgets, selection volumes,
+	// and audio ranges. Only physical target components should trigger detonation.
+	// Apply the same solidity check to overlap and hit events.
 	if (OtherComp)
 	{
 		const ECollisionEnabled::Type Solidity = OtherComp->GetCollisionEnabled();
@@ -461,7 +436,7 @@ bool UPayloadAttachmentComponent::TryKamikazeDetonate(
 	if (!AttachedPayload)
 		return false;
 
-	// Velocity threshold check
+	// Check the minimum kamikaze speed.
 	UPrimitiveComponent* OwnerRoot = GetOwnerRootMesh();
 	if (OwnerRoot)
 	{
@@ -480,7 +455,7 @@ bool UPayloadAttachmentComponent::TryKamikazeDetonate(
 
 	DestroyPhysicsConstraint();
 
-	// Notify mission manager
+	// Notify the mission manager.
 	if (CachedMissionManager)
 	{
 		CachedMissionManager->NotifyKamikazeTriggered();
@@ -492,18 +467,11 @@ bool UPayloadAttachmentComponent::TryKamikazeDetonate(
 	AttachedPayload = nullptr;
 	CachedPayloadMass = 0.0f;
 
-	// Symmetry with DetachPayload — UI / game code that listens for payload
-	// state changes should learn that the kamikaze payload is gone too.
+	// Notify listeners that the payload has been removed.
 	OnPayloadStateChanged.Broadcast(false);
 
-	// Deliberately AFTER Explode(): the blast has to land, and any target it
-	// destroys has to be struck off the mission's list, before the mission is
-	// told the drone is gone. Reversed, a kamikaze that cleared the final
-	// target would be recorded as a failure.
-	//
-	// Without this call the drone simply vanished: the mission stayed
-	// InProgress with no pawn and no carrier to respawn a payload onto, and
-	// nothing resolved until the clock ran out.
+	// Notify the mission manager after the explosion so destroyed targets are
+	// processed before the drone-destruction result is evaluated.
 	if (CachedMissionManager)
 	{
 		CachedMissionManager->NotifyDroneDestroyed();

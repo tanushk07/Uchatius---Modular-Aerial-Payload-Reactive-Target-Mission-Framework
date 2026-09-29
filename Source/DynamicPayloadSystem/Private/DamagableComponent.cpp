@@ -4,6 +4,8 @@
 #include "Components/PrimitiveComponent.h"
 #include "DynamicPayloadSystemModule.h"
 #include "GameFramework/Actor.h"
+#include "Engine/World.h"
+#include "TimerManager.h"
 
 UDamagableComponent::UDamagableComponent()
 {
@@ -14,9 +16,8 @@ void UDamagableComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Defensive: a designer or Blueprint setter that bypasses the ClampMin meta
-	// (e.g. SetMaxHealth at runtime) can still drive MaxHealth to 0. Snap it
-	// up so UpdateStructuralState never short-circuits.
+	// ClampMin only works in the editor - a BP can still set MaxHealth to 0
+	// at runtime. Bump it back up so the state logic keeps working.
 	if (MaxHealth <= 0.f)
 	{
 #if WITH_EDITOR
@@ -90,14 +91,42 @@ void UDamagableComponent::SetHighlightEnabled(bool bEnabled)
 	}
 }
 
+void UDamagableComponent::CancelPendingDespawn()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DespawnTimerHandle);
+	}
+}
+
+void UDamagableComponent::SoftDespawn()
+{
+	AActor* Owner = GetOwner();
+	if (!Owner || StructuralState != EStructuralState::Destroyed)
+		return;
+
+	Owner->SetActorHiddenInGame(true);
+	Owner->SetActorEnableCollision(false);
+	bSoftDespawned = true;
+}
+
 void UDamagableComponent::Revive()
 {
-	// Order matters: a Destroyed target already has a lifespan counting down
-	// toward despawn, and clearing it first means a revive inside that window
-	// keeps the actor alive rather than losing it a frame later.
+	// Cancel pending despawn before restoring the target to prevent the timer
+	// from hiding it again after revival.
+	CancelPendingDespawn();
+
 	if (AActor* Owner = GetOwner())
 	{
+		// In case a Blueprint set a lifespan on it too.
 		Owner->SetLifeSpan(0.f);
+
+		if (bSoftDespawned)
+		{
+			Owner->SetActorHiddenInGame(false);
+			Owner->SetActorEnableCollision(true);
+			bSoftDespawned = false;
+		}
 	}
 
 	CurrentHealth = MaxHealth;
@@ -105,9 +134,8 @@ void UDamagableComponent::Revive()
 	const EStructuralState Previous = StructuralState;
 	StructuralState = EStructuralState::Intact;
 
-	// Only broadcast on an actual transition. Listeners rebuild render state
-	// from this, and firing it for targets that were never damaged would churn
-	// meshes and collision on every retry for no reason.
+	// Only fire on a real change. Listeners swap meshes/collision on this, and
+	// doing that for every untouched target on each retry is pointless.
 	if (Previous != StructuralState)
 	{
 		OnStructuralStateChanged.Broadcast(StructuralState);
@@ -116,9 +144,7 @@ void UDamagableComponent::Revive()
 
 void UDamagableComponent::UpdateStructuralState()
 {
-	// Runtime safety: BeginPlay snaps MaxHealth up to 1.0 if a designer left it
-	// at zero, but BP code can still call Set MaxHealth = 0 at runtime. Snap
-	// here too so UpdateStructuralState never short-circuits permanently.
+	// BeginPlay fixes a zero MaxHealth, but BP can still set it to 0 later.
 	if (MaxHealth <= 0.f)
 	{
 #if WITH_EDITOR
@@ -153,20 +179,17 @@ void UDamagableComponent::UpdateStructuralState()
 	{
 		StructuralState = NewState;
 
-		// Wire DestroyDelay through SetLifeSpan so the actor self-despawns
-		// after the destroyed-state visuals (mesh swap, glow off) have played.
-		// SetLifeSpan(0) means "don't auto-destroy", so a user can opt out by
-		// setting DestroyDelay = 0 and handling cleanup themselves.
-		//
-		// Armed BEFORE the broadcast, deliberately. Listeners are entitled to
-		// override this - the mission manager cancels it so a destroyed target
-		// survives to be revived on a retry - and a listener cannot cancel a
-		// lifespan that has not been set yet.
+		// Hide the wreck after DestroyDelay while keeping the actor alive so a
+		// reset can restore its level-instance configuration. A zero delay leaves
+		// the wreck visible. Arm the timer before broadcasting so listeners can
+		// cancel it.
 		if (NewState == EStructuralState::Destroyed && DestroyDelay > 0.f)
 		{
-			if (AActor* Owner = GetOwner())
+			if (UWorld* World = GetWorld())
 			{
-				Owner->SetLifeSpan(DestroyDelay);
+				World->GetTimerManager().SetTimer(
+					DespawnTimerHandle, this, &UDamagableComponent::SoftDespawn,
+					DestroyDelay, false);
 			}
 		}
 

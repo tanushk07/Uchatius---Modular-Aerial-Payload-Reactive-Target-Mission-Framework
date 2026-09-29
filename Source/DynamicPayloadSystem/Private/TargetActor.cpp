@@ -10,8 +10,7 @@
 
 ATargetActor::ATargetActor()
 {
-	// Tick disabled — Tick() body is empty. Subclasses that need ticking
-	// should set bCanEverTick = true in their constructor.
+	// No tick, Tick() is empty. Subclasses can turn it on if they need it.
 	PrimaryActorTick.bCanEverTick = false;
 
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
@@ -40,8 +39,7 @@ void ATargetActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Snapshot the untouched starting state before anything can damage or move
-	// this actor. Everything a mission retry restores is read back from here.
+	// Save the initial state used by mission resets.
 	InitialTransform = GetActorTransform();
 	bInitialActorTickEnabled = IsActorTickEnabled();
 	if (Mesh)
@@ -72,10 +70,8 @@ void ATargetActor::BeginPlay()
 		);
 	}
 
-	// Late-spawn registration: if a mission manager exists and the mission is
-	// already InProgress, this target gets folded into the active mission.
-	// RegisterMissionTarget is a no-op outside InProgress, so targets that
-	// spawn before mission start are picked up by StartMission's iterator.
+	// Register targets spawned during an active mission. StartMission collects
+	// targets spawned before the mission begins.
 	if (bIsMissionTarget)
 	{
 		TActorIterator<APayloadMissionManager> MissionManagerIt(GetWorld());
@@ -131,9 +127,7 @@ void ATargetActor::HandleStructuralStateChanged(EStructuralState NewState)
 	}
 	else
 	{
-		// Coming back from Destroyed - a mission retry reviving this target.
-		// Everything the branch above switched off has to be switched back on,
-		// otherwise a revived truck is invisible to traces and never moves.
+		// Restore collision, rendering, and movement after the target is revived.
 		Mesh->SetCollisionEnabled(InitialCollisionEnabled);
 		Mesh->bRenderCustomDepth = bIsMissionTarget;
 		Mesh->MarkRenderStateDirty();

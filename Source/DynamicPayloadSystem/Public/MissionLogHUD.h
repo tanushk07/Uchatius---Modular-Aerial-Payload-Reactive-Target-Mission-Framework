@@ -13,40 +13,29 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
 	const FGameLogEntry&, Entry
 );
 
-/**
- * A ready-made HUD that receives mission log entries and re-broadcasts them
- * to Blueprint.
- *
- * APayloadMissionManager delivers its log through IMissionLogReceiver, and it
- * only delivers to the HUD. If the HUD does not implement that interface every
- * mission message is silently discarded - which is easy to hit, because the
- * default AHUD does not implement it and nothing fails loudly.
- *
- * Set this (or a Blueprint child of it) as the game mode's HUD Class, bind
- * OnMissionLog, and mission events reach the UI with no glue code.
- */
+/** HUD implementation of IMissionLogReceiver that forwards mission log entries
+ *  to Blueprint. Set this class or a Blueprint child as the GameMode HUD class
+ *  and bind OnMissionLog to receive entries. */
 UCLASS(Blueprintable, ClassGroup = (Mission))
 class DYNAMICPAYLOADSYSTEM_API AMissionLogHUD : public AHUD, public IMissionLogReceiver
 {
 	GENERATED_BODY()
 
 public:
-	/** Fires once per mission log entry, in the order the mission emitted them
-	 *  (including any queued before this HUD existed). */
+	/** Broadcast once per log entry, in order, including entries queued before the HUD was created. */
 	UPROPERTY(BlueprintAssignable, Category = "Mission|Log")
 	FOnMissionLogReceived OnMissionLog;
 
-	/** Recent entries, newest last. Lets a widget created after the fact show
-	 *  history instead of starting blank. */
+	/** Recent entries in chronological order, with the newest entry last. */
 	UPROPERTY(BlueprintReadOnly, Category = "Mission|Log")
 	TArray<FGameLogEntry> LogHistory;
 
-	/** Cap on LogHistory. 0 disables history entirely. */
+	/** Maximum number of entries retained in LogHistory. Zero disables history. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Mission|Log",
 		meta = (ClampMin = "0"))
 	int32 MaxLogHistory = 64;
 
-	/** Most recent message as a plain string, for direct widget binding. */
+	/** Return the most recent message as a string. */
 	UFUNCTION(BlueprintPure, Category = "Mission|Log")
 	FString GetLastMessage() const;
 

@@ -7,10 +7,12 @@
 #include "TimerManager.h"
 #include "EngineUtils.h"
 #include "Payload.h"
+#include "Explosive.h"
 #include "TargetActor.h"
 #include "MissionLogReceiver.h"
 #include "GameFramework/HUD.h"
 #include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerStart.h"
 #include "GameFramework/GameModeBase.h"
@@ -28,6 +30,11 @@ void APayloadMissionManager::BeginPlay()
 	if (!GetWorld())
 		return;
 
+	// Capture targets next tick so each actor has completed BeginPlay and saved
+	// its InitialTransform, regardless of actor initialization order.
+	GetWorld()->GetTimerManager().SetTimerForNextTick(
+		this, &APayloadMissionManager::CaptureLevelTargets);
+
 	if (bMissionModeEnabled)
 	{
 		RequestMissionStart();
@@ -39,17 +46,9 @@ void APayloadMissionManager::RequestMissionStart()
 	if (!bMissionModeEnabled)
 		return;
 
-	// A finished mission leaves MissionState at Success or Failed, and
-	// StartMission refuses to run unless it is NotStarted. Nothing used to put
-	// it back, so every Play after the first mission was silently dead: the
-	// countdown ran, StartMission returned immediately, and therefore no
-	// targets were registered, no snapshot was captured, and - because
-	// SpawnAndAttachPayload is gated on the mission being InProgress - the
-	// drone never received a payload either.
-	//
-	// RetryMission already performs exactly the teardown a fresh start needs
-	// (timers, counters, delegate bindings, world reset) and calls
-	// HandleMissionStart itself, so hand off to it rather than duplicating.
+	// A finished mission is stuck on Success/Failed and StartMission won't run
+	// from there - that's how the second Play used to do nothing at all.
+	// RetryMission already cleans everything up and restarts, so just use it.
 	if (MissionState != EPayloadMissionState::NotStarted)
 	{
 		RetryMission();
@@ -91,9 +90,7 @@ void APayloadMissionManager::HandleMissionStart()
 
 	CountdownTimeRemaining = CountdownStartTime;
 
-	// Announce the opening number now rather than waiting a second for the
-	// first tick, otherwise a countdown UI would come up blank and only catch
-	// up from CountdownStartTime - 1.
+	// Send the first number right away, otherwise the UI sits blank for a second.
 	OnMissionCountdown.Broadcast(CountdownTimeRemaining);
 
 	GetWorld()->GetTimerManager().SetTimer(
@@ -109,16 +106,12 @@ void APayloadMissionManager::TickCountdown()
 {
 	CountdownTimeRemaining--;
 
-	// Start ON zero, not after it. Counting down to < 0 spent an extra second
-	// sitting on 0, so a CountdownStartTime of 3 ran for 4 seconds and any UI
-	// following along had a dead beat between "1" and the mission actually
-	// starting.
+	// Go on 0, not after it (a 3s countdown used to take 4).
 	if (CountdownTimeRemaining <= 0)
 	{
 		GetWorld()->GetTimerManager().ClearTimer(CountdownTimerHandle);
 
-		// StartMission broadcasts OnMissionStateChanged(InProgress), which is
-		// the "GO" beat - so zero is not broadcast here. See FOnMissionCountdown.
+		// No "0" broadcast - StartMission's state change is the "GO".
 		StartMission();
 		return;
 	}
@@ -140,12 +133,8 @@ void APayloadMissionManager::StartMission()
 	OnMissionStateChanged.Broadcast(MissionState);
 	RemainingTime = MissionDuration;
 
-	// Reset here, at the moment the mission actually begins, rather than only
-	// when Retry was pressed. The countdown runs for several seconds and the
-	// vehicles keep driving through it, so a world reset performed before the
-	// countdown has already been undone by the time the player takes control -
-	// which looks exactly like the reset never happened. No-op on the first
-	// mission, when no snapshot exists yet.
+	// Reset now, not when Retry is pressed - the trucks keep driving during
+	// the countdown, so an earlier reset looked like it never happened.
 	ResetMissionWorld();
 
 	TotalDamageInflicted = 0.f;
@@ -153,8 +142,8 @@ void APayloadMissionManager::StartMission()
 
 	EmitMissionLog(TEXT("Mission Started"), ELogSeverity::Info);
 
-	// Discover all mission targets currently in the world. Late-spawned targets
-	// self-register via ATargetActor::BeginPlay.
+	// Grab everything that's already here. Anything spawned later registers
+	// itself from ATargetActor::BeginPlay.
 	for (TActorIterator<ATargetActor> It(GetWorld()); It; ++It)
 	{
 		RegisterMissionTarget(*It);
@@ -172,8 +161,7 @@ void APayloadMissionManager::StartMission()
 		true
 	);
 
-	// Spawn payload on the first actor that actually has a
-	// PayloadAttachmentComponent (see SpawnPayloadOnCarrier).
+	// Give the player's drone its payload (see SpawnPayloadOnCarrier).
 	SpawnPayloadOnCarrier();
 }
 
@@ -194,12 +182,8 @@ void APayloadMissionManager::RegisterMissionTarget(ATargetActor* Target)
 
 	DamageableTargets.Add(Target);
 
-	// Drop any existing subscription before adding one. A target can arrive here
-	// still carrying a binding from a previous mission - RetryMission can only
-	// unbind what is still listed in DamageableTargets, and destroyed targets
-	// were struck off that list as they died. Removing first makes registration
-	// idempotent no matter what came before, so a target is never subscribed
-	// twice and OnTargetDamageTaken cannot count the same hit more than once.
+	// Unbind first. A target can still be bound from the last mission, and
+	// binding it twice counted every hit twice.
 	DC->OnStructuralStateChanged.RemoveDynamic(
 		this, &APayloadMissionManager::OnTargetStructuralStateChanged);
 	DC->OnDamageTaken.RemoveDynamic(
@@ -282,20 +266,12 @@ void APayloadMissionManager::OnTargetStructuralStateChanged(EStructuralState New
 			TargetsDestroyedCount++;
 			DC->SetHighlightEnabled(false);
 
-			// Cancel the despawn that DestroyDelay just scheduled.
-			//
-			// A target's behaviour lives in per-instance references set by the
-			// level author - the spline it drives, the leader it follows, its
-			// movement mode. None of that is in the class defaults, so an actor
-			// rebuilt from its class comes back unable to move, and a rebuilt
-			// leader leaves every follower pointing at a destroyed actor.
-			//
-			// Keeping the wreck means a retry can Revive() the ORIGINAL actor
-			// with all of that intact. The wreck stays visible in the meantime,
-			// which is what a destroyed vehicle should look like anyway.
+			// Keep destroyed targets visible for the rest of the mission when world
+			// reset is enabled. Cancel the delayed hide; the actor remains available
+			// for revival either way.
 			if (bResetWorldOnRetry)
 			{
-				Actor->SetLifeSpan(0.f);
+				DC->CancelPendingDespawn();
 			}
 
 			DamageableTargets.RemoveAt(i);
@@ -365,18 +341,15 @@ void APayloadMissionManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		}
 	}
 
-	// Disable highlights BEFORE Empty()-ing the list — the function iterates
-	// DamageableTargets internally, so clearing first made the call a no-op.
+	// Highlights off BEFORE emptying the list, otherwise there's nothing to turn off.
 	DisableAllTargetHighlights();
 	DamageableTargets.Empty();
 
 	if (UWorld* World = GetWorld())
 	{
 		FTimerManager& TM = World->GetTimerManager();
-		// UE auto-cancels timers when the target UObject dies, so these are
-		// defensive — but explicit cleanup keeps state predictable when the
-		// manager is destroyed before its timer windows close (level streaming,
-		// sub-level unload, world travel).
+		// UE clears these when we're destroyed anyway, this is just belt and braces
+		// (level streaming, world travel etc.).
 		TM.ClearTimer(MissionTimerHandle);
 		TM.ClearTimer(LastPayloadResolveTimerHandle);
 		TM.ClearTimer(LastPayloadWatchdogHandle);
@@ -396,10 +369,8 @@ void APayloadMissionManager::NotifyAttemptConsumed()
 	if (MissionState != EPayloadMissionState::InProgress)
 		return;
 
-	// Clamp so BP code that calls SpawnAndAttachPayload manually after attempts
-	// hit zero (then detaches) doesn't drive the counter negative. Every downstream
-	// gate uses <= 0 so negativity wouldn't matter for correctness, but it breaks
-	// UI displays that show the count.
+	// Clamp at 0. Nothing breaks if it goes negative, but the UI would show
+	// "-1 attempts".
 	AttemptsRemaining = FMath::Max(AttemptsRemaining - 1, 0);
 
 	EmitMissionLog(
@@ -429,8 +400,7 @@ void APayloadMissionManager::RespawnPayloadDelayed()
 	if (AttemptsRemaining <= 0 || bWaitingForLastPayload)
 		return;
 
-	// Respawn payload on the first actor that actually has a
-	// PayloadAttachmentComponent (see SpawnPayloadOnCarrier).
+	// Give the drone its next payload (see SpawnPayloadOnCarrier).
 	SpawnPayloadOnCarrier();
 }
 
@@ -443,8 +413,8 @@ void APayloadMissionManager::NotifyLastPayloadResolved()
 
 	if (DamageableTargets.Num() == 0)
 	{
-		// Nothing left to destroy - resolve now instead of returning and
-		// making the player wait out the full watchdog timeout.
+		// Nothing left to destroy, so resolve now instead of making the player
+		// sit through the watchdog.
 		DeferredResolveLastPayload();
 		return;
 	}
@@ -460,14 +430,12 @@ void APayloadMissionManager::NotifyLastPayloadResolved()
 
 void APayloadMissionManager::DeferredResolveLastPayload()
 {
-	// Both the normal resolve timer and the watchdog can race to call this.
-	// This guard makes it idempotent: whichever fires first transitions
-	// MissionState out of InProgress; the second call early-returns here.
+	// The resolve timer and the watchdog can both land here. First one wins,
+	// the second sees we're not InProgress anymore and bails.
 	if (MissionState != EPayloadMissionState::InProgress)
 		return;
 
-	// We are resolving now — cancel every pending path into this function
-	// so a stale timer/watchdog can't fire a second time into a new state.
+	// Resolving now, so kill anything else that could call back in here.
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(LastPayloadResolveTimerHandle);
@@ -497,11 +465,9 @@ bool APayloadMissionManager::SpawnPayloadOnCarrier()
 	if (!World)
 		return false;
 
-	// The possessed pawn first. A world scan picks whichever carrier the actor
-	// iterator happens to reach first, and any flow that spawns a fresh pawn
-	// without destroying the old one (returning to the menu and pressing Play
-	// again) leaves stale drones behind - so the payload would attach to a
-	// ghost the player is not flying, and appear never to spawn at all.
+	// Try the drone the player is actually flying first. Going back to the menu
+	// and hitting Play can leave old drones lying around, and the payload used to
+	// end up on one of those instead.
 	if (APlayerController* PC = World->GetFirstPlayerController())
 	{
 		if (APawn* PlayerPawn = PC->GetPawn())
@@ -532,15 +498,10 @@ bool APayloadMissionManager::SpawnPayloadOnCarrier()
 
 void APayloadMissionManager::EnterWaitingForLastPayload()
 {
-	// Single, canonical entry into the "attempts exhausted, a payload may
-	// still be live" state. Every caller funnels through here so the
-	// watchdog is ALWAYS armed whenever bWaitingForLastPayload is true.
-	//
-	// Idempotency: once we're in the waiting state, additional calls (e.g. BP
-	// code that manually respawns + detaches a payload after attempts are
-	// already exhausted) are no-ops. Otherwise each re-entry would reset the
-	// 10s watchdog and a determined caller could indefinitely postpone
-	// resolution, breaking the watchdog's "hard upper bound" promise.
+	// The one way into "out of attempts, but a payload might still be falling".
+	// Going through here means the watchdog always gets armed.
+	// If we're already waiting, do nothing - otherwise every call would restart
+	// the watchdog and the mission could be kept hanging forever.
 	if (bWaitingForLastPayload)
 	{
 		return;
@@ -568,8 +529,7 @@ void APayloadMissionManager::StartLastPayloadWatchdog()
 
 void APayloadMissionManager::OnLastPayloadWatchdogExpired()
 {
-	// If the normal path already resolved the mission, MissionState is no
-	// longer InProgress and there is nothing to do.
+	// Already resolved the normal way? Nothing to do.
 	if (MissionState != EPayloadMissionState::InProgress)
 		return;
 
@@ -578,8 +538,7 @@ void APayloadMissionManager::OnLastPayloadWatchdogExpired()
 		ELogSeverity::Warning
 	);
 
-	// Route through the single shared exit point. State is evaluated from
-	// DamageableTargets exactly as a normal resolution would.
+	// Same exit as a normal resolve.
 	DeferredResolveLastPayload();
 }
 
@@ -612,11 +571,9 @@ void APayloadMissionManager::EmitMissionLog(
 
 	if (!HUD->GetClass()->ImplementsInterface(UMissionLogReceiver::StaticClass()))
 	{
-		// HUD exists but won't receive logs. Drop the entry rather than queuing
-		// it, otherwise PendingMissionLogs would grow unbounded for the entire
-		// session. Warn once per mission manager instance — outside WITH_EDITOR
-		// so shipping builds get the diagnostic too. Without it, consumers see
-		// silent log drop and have no signal pointing at the missing interface.
+		// The HUD doesn't implement the log interface, so drop the log (queuing it
+		// would just grow forever). Warn once, in shipping builds too, or you'd never
+		// know why the logs aren't showing up.
 		if (!bWarnedAboutMissingInterface)
 		{
 			UE_LOG(LogDynamicPayload, Warning,
@@ -628,8 +585,7 @@ void APayloadMissionManager::EmitMissionLog(
 		return;
 	}
 
-	// Drain any logs that were queued before the HUD existed. We flush in order
-	// so the consumer always sees mission events in the sequence they occurred.
+	// Send the backlog first so everything shows up in order.
 	for (const FGameLogEntry& Pending : PendingMissionLogs)
 	{
 		IMissionLogReceiver::Execute_PushGameLog(HUD, Pending);
@@ -662,11 +618,9 @@ void APayloadMissionManager::NotifyDroneDestroyed()
 	if (MissionState != EPayloadMissionState::InProgress)
 		return;
 
-	// A kamikaze that takes out the LAST target has won, and losing the drone
-	// to its own blast must not overwrite that. Destroyed targets are removed
-	// from DamageableTargets as they die, so an empty list here means the
-	// field is clear and HandleAllTargetsDestroyed is already queued for the
-	// next tick - bow out and let it resolve as a success.
+	// If the kamikaze took out the LAST target, that's a win - don't turn it
+	// into a failure just because the drone blew up too. An empty list means
+	// HandleAllTargetsDestroyed is already queued, so let that handle it.
 	if (DamageableTargets.Num() == 0)
 		return;
 
@@ -688,18 +642,14 @@ void APayloadMissionManager::NotifyKamikazeTriggered()
 		ELogSeverity::Warning
 	);
 
-	// Only enter the waiting state if attempts are genuinely exhausted AND
-	// targets remain. Previously this was set unconditionally on every
-	// kamikaze, which froze the mission even when the player still had
-	// attempts left and should simply have respawned.
+	// Only wait if the player is really out of attempts AND something is still
+	// standing. This used to trigger on every kamikaze and froze the mission
+	// even with attempts to spare.
 	if (AttemptsRemaining <= 0 && DamageableTargets.Num() > 0)
 	{
-		// Schedule resolution explicitly here. Do NOT rely on the
-		// subsequent APayload::Explode() incidentally calling
-		// NotifyLastPayloadResolved() in the right order - that coupling
-		// was the original latent hang. EnterWaitingForLastPayload() arms
-		// the watchdog; we additionally arm the normal (shorter) resolve
-		// timer so a clean kamikaze still resolves promptly.
+		// Arm the resolve timer here. Relying on the payload's Explode() to call
+		// back at the right moment is what caused the old hang. The watchdog is
+		// the backup; this is the normal, faster path.
 		EnterWaitingForLastPayload();
 
 		if (UWorld* World = GetWorld())
@@ -721,30 +671,8 @@ void APayloadMissionManager::CaptureMissionSnapshot()
 	if (bMissionSnapshotCaptured)
 		return;
 
-	MissionTargetSnapshots.Reset();
-	for (AActor* Actor : DamageableTargets)
-	{
-		if (!IsValid(Actor))
-			continue;
-
-		FMissionTargetSnapshot Snapshot;
-		Snapshot.TargetClass = Actor->GetClass();
-		Snapshot.LiveActor = Actor;
-
-		// Prefer the transform the target recorded at BeginPlay. Reading the
-		// actor's transform here would capture wherever a convoy had driven to
-		// during the countdown, not where the level author placed it.
-		if (const ATargetActor* Target = Cast<ATargetActor>(Actor))
-		{
-			Snapshot.SpawnTransform = Target->GetInitialTransform();
-		}
-		else
-		{
-			Snapshot.SpawnTransform = Actor->GetActorTransform();
-		}
-
-		MissionTargetSnapshots.Add(Snapshot);
-	}
+	// Level target snapshots are normally captured one tick after BeginPlay.
+	CaptureLevelTargets();
 
 	if (const UWorld* World = GetWorld())
 	{
@@ -755,8 +683,7 @@ void APayloadMissionManager::CaptureMissionSnapshot()
 				PlayerRestartTransform = Pawn->GetActorTransform();
 				CapturedPlayerPawnClass = Pawn->GetClass();
 
-				// Remember what the configuration screen injected, so the
-				// replacement drone is armed the same way as the original.
+				// Remember what the config screen gave it, so the respawned drone matches.
 				if (const UPayloadAttachmentComponent* Attach =
 					Pawn->FindComponentByClass<UPayloadAttachmentComponent>())
 				{
@@ -770,6 +697,91 @@ void APayloadMissionManager::CaptureMissionSnapshot()
 	bMissionSnapshotCaptured = true;
 }
 
+void APayloadMissionManager::CaptureLevelTargets()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+		return;
+
+	// Bind after the player controller becomes available so possession changes
+	// can be observed in both Free Play and Mission Play.
+	if (APlayerController* PC = World->GetFirstPlayerController())
+	{
+		PC->OnPossessedPawnChanged.AddUniqueDynamic(
+			this, &APayloadMissionManager::OnPlayerPossessedPawnChanged);
+
+		// Save a fallback restart transform for levels without a PlayerStart.
+		if (!bMissionSnapshotCaptured && PC->GetPawn())
+		{
+			PlayerRestartTransform = PC->GetPawn()->GetActorTransform();
+		}
+	}
+
+	if (bTargetSnapshotCaptured)
+		return;
+
+	MissionTargetSnapshots.Reset();
+	for (TActorIterator<ATargetActor> It(World); It; ++It)
+	{
+		ATargetActor* Target = *It;
+		if (!IsValid(Target))
+			continue;
+
+		FMissionTargetSnapshot Snapshot;
+		Snapshot.TargetClass = Target->GetClass();
+		Snapshot.LiveActor = Target;
+
+		// Preserve the level placement using the transform recorded at BeginPlay.
+		Snapshot.SpawnTransform = Target->GetInitialTransform();
+
+		MissionTargetSnapshots.Add(Snapshot);
+	}
+
+	bTargetSnapshotCaptured = true;
+
+#if WITH_EDITOR
+	if (bShowDebug)
+	{
+		UE_LOG(LogDynamicPayload, Display,
+			TEXT("[Mission] Recorded %d level targets for resets"), MissionTargetSnapshots.Num());
+	}
+#endif
+}
+
+void APayloadMissionManager::OnPlayerPossessedPawnChanged(APawn* OldPawn, APawn* NewPawn)
+{
+	// Ignore pawn unpossession and mission-managed respawn events.
+	if (!NewPawn || bResettingPlayer)
+		return;
+
+	// Defer handling until the next tick because the menu possesses the pawn
+	// before updating bMissionModeEnabled and calling RequestMissionStart.
+	GetWorld()->GetTimerManager().SetTimerForNextTick(
+		this, &APayloadMissionManager::HandleNewSessionStarted);
+}
+
+void APayloadMissionManager::HandleNewSessionStarted()
+{
+	// Clear the previous mission state and timers when entering Free Play from
+	// a running mission, countdown, or completed mission.
+	if (!bMissionModeEnabled)
+	{
+		if (MissionState != EPayloadMissionState::NotStarted
+			|| GetWorld()->GetTimerManager().IsTimerActive(CountdownTimerHandle))
+		{
+			TeardownMission();
+		}
+	}
+	// StartMission resets the world after a countdown. Preserve world state for
+	// an active mission and reset targets for other new sessions.
+	else if (MissionState == EPayloadMissionState::InProgress)
+	{
+		return;
+	}
+
+	ResetTargetsToStart();
+}
+
 void APayloadMissionManager::ResetPlayerToStart()
 {
 	UWorld* World = GetWorld();
@@ -780,8 +792,9 @@ void APayloadMissionManager::ResetPlayerToStart()
 	if (!PC)
 		return;
 
-	// Where home is. A PlayerStart in the level wins; the transform captured at
-	// mission start is the fallback for levels without one.
+	TGuardValue<bool> ResettingGuard(bResettingPlayer, true);
+
+	// Use the PlayerStart if there is one, otherwise the saved transform.
 	FTransform Destination = PlayerRestartTransform;
 	TActorIterator<APlayerStart> PlayerStartIt(World);
 	if (PlayerStartIt)
@@ -791,8 +804,7 @@ void APayloadMissionManager::ResetPlayerToStart()
 
 	APawn* OldPawn = PC->GetPawn();
 
-	// Which class to rebuild from. The captured class is authoritative because
-	// OldPawn may not exist at all.
+	// Prefer the saved class - the old pawn might not exist anymore.
 	TSubclassOf<APawn> PawnClass = CapturedPlayerPawnClass;
 	if (!PawnClass && OldPawn)
 	{
@@ -824,8 +836,8 @@ void APayloadMissionManager::ResetPlayerToStart()
 		return;
 	}
 
-	// Carry the injected payload setup forward. Read it from the live pawn when
-	// there is one, otherwise fall back to what was captured at mission start.
+	// Keep the payload setup from the current drone if there is one,
+	// otherwise use what was saved at mission start.
 	TSubclassOf<APayload> PayloadClassToApply = CapturedPayloadClass;
 	bool bKamikazeToApply = bCapturedKamikazeMode;
 	if (OldPawn)
@@ -841,10 +853,9 @@ void APayloadMissionManager::ResetPlayerToStart()
 		}
 	}
 
-	// Rebuild rather than teleport. Teleporting only works when a pawn still
-	// exists, and a kamikaze destroys it outright - which left the player with
-	// no drone at all after a retry. A fresh pawn also guarantees no leftover
-	// velocity, attitude, or half-attached payload from the failed attempt.
+	// Spawn a new drone instead of teleporting. After a kamikaze there's
+	// nothing left to teleport, and a fresh one has no leftover velocity or
+	// half-attached payload either.
 	if (OldPawn)
 	{
 		PC->UnPossess();
@@ -885,9 +896,78 @@ void APayloadMissionManager::ResetMissionWorld()
 	if (!bResetWorldOnRetry)
 		return;
 
+	ResetTargetsToStart();
+
+	if (bResetPlayerOnRetry)
+	{
+		ResetPlayerToStart();
+	}
+}
+
+void APayloadMissionManager::ClearLeftoversFromLastAttempt()
+{
 	UWorld* World = GetWorld();
 	if (!World)
 		return;
+
+	// Blasts from the last attempt. Their sound is attached to them, so this is
+	// also what stops a bang that was cut off by the pause from finishing after
+	// the retry. Only ones that already went off - placed explosives stay.
+	for (TActorIterator<AExplosive> It(World); It; ++It)
+	{
+		if (It->HasDetonated())
+		{
+			It->Destroy();
+		}
+	}
+
+	// Same story for camera shakes: they live on the player's camera manager,
+	// not on the explosive, so they just pause with the game and carry on
+	// shaking after the retry. Kill them outright.
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (APlayerController* PC = It->Get())
+		{
+			if (PC->PlayerCameraManager)
+			{
+				PC->PlayerCameraManager->StopAllCameraShakes(/*bImmediately=*/ true);
+			}
+		}
+	}
+
+	// Payloads still falling. Left alone they'd land after the unpause and hit
+	// the freshly revived targets. Ones a drone is still holding are kept.
+	TSet<const APayload*> Held;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (const UPayloadAttachmentComponent* Attach =
+			It->FindComponentByClass<UPayloadAttachmentComponent>())
+		{
+			if (const APayload* P = Attach->GetAttachedPayload())
+			{
+				Held.Add(P);
+			}
+		}
+	}
+	for (TActorIterator<APayload> It(World); It; ++It)
+	{
+		if (!Held.Contains(*It))
+		{
+			It->Destroy();
+		}
+	}
+}
+
+void APayloadMissionManager::ResetTargetsToStart()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+		return;
+
+	// Capture targets on demand if reset runs before the deferred startup capture.
+	CaptureLevelTargets();
+
+	ClearLeftoversFromLastAttempt();
 
 	for (FMissionTargetSnapshot& Snapshot : MissionTargetSnapshots)
 	{
@@ -895,15 +975,10 @@ void APayloadMissionManager::ResetMissionWorld()
 
 		if (!IsValid(Actor))
 		{
-			// Last resort. Normally unreachable: OnTargetStructuralStateChanged
-			// cancels the lifespan of destroyed targets precisely so they are
-			// still here to revive. We only get here if the target left play by
-			// some other route (bResetWorldOnRetry toggled mid-mission, a
-			// Blueprint Destroy, level streaming).
-			//
-			// A class-default rebuild CANNOT restore the level author's
-			// per-instance wiring - spline, convoy leader, movement mode - so
-			// the replacement will sit still. Warn rather than fail silently.
+			// Shouldn't really happen anymore, since destroyed targets are only hidden.
+			// If something else deleted it (BP Destroy, level streaming) we respawn it
+			// from its class - but that loses the level-placed setup (spline, convoy
+			// leader, movement mode) and it won't drive, hence the warning.
 			if (!Snapshot.TargetClass)
 				continue;
 
@@ -929,22 +1004,31 @@ void APayloadMissionManager::ResetMissionWorld()
 			DC->Revive();
 		}
 
-		// Runs for respawned and revived targets alike: a freshly spawned actor
-		// is already home, but this also clears the movement state, and a
-		// survivor needs both.
+		// Put movers back on their route (this also clears their movement state).
 		if (UMovableTargetComponent* MC = Actor->FindComponentByClass<UMovableTargetComponent>())
 		{
 			MC->ResetToStart();
 		}
-	}
-
-	if (bResetPlayerOnRetry)
-	{
-		ResetPlayerToStart();
+		else
+		{
+			// Restore static targets displaced by an explosion.
+			Actor->SetActorTransform(Snapshot.SpawnTransform, false, nullptr, ETeleportType::TeleportPhysics);
+		}
 	}
 }
 
 void APayloadMissionManager::RetryMission()
+{
+	TeardownMission();
+
+	// Reset after teardown removes delegate bindings. Revive broadcasts state
+	// changes that should not be handled as events from the new mission.
+	ResetMissionWorld();
+
+	HandleMissionStart();
+}
+
+void APayloadMissionManager::TeardownMission()
 {
 	GetWorld()->GetTimerManager().ClearTimer(MissionTimerHandle);
 	GetWorld()->GetTimerManager().ClearTimer(CountdownTimerHandle);
@@ -963,10 +1047,8 @@ void APayloadMissionManager::RetryMission()
 	TargetsDestroyedCount = 0;
 	InitialTargetCount = 0;
 
-	// Unbind from the whole original line-up, not just DamageableTargets. Targets
-	// destroyed during the mission were removed from that list as they died, so
-	// iterating it alone would leave their bindings in place - which is exactly
-	// the state RegisterMissionTarget now defends against.
+	// Unbind from every recorded target, not just DamageableTargets - dead
+	// targets were already removed from that list and would stay bound.
 	auto UnbindFrom = [this](AActor* Actor)
 	{
 		if (!IsValid(Actor))
@@ -993,18 +1075,12 @@ void APayloadMissionManager::RetryMission()
 	{
 		UnbindFrom(Snapshot.LiveActor.Get());
 	}
+	DisableAllTargetHighlights();
 	DamageableTargets.Empty();
 
 	// Clear any pre-HUD logs queued during the failed mission so they don't
 	// flush into the HUD at retry start.
 	PendingMissionLogs.Reset();
-
-	// Deliberately after the unbind above: reviving a target broadcasts a
-	// structural-state change, and this manager should not be listening to the
-	// mission it is in the middle of tearing down.
-	ResetMissionWorld();
-
-	HandleMissionStart();
 }
 
 void APayloadMissionManager::QuitGameDelayed()

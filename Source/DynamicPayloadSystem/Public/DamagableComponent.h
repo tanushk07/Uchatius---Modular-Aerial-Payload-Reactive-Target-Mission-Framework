@@ -41,6 +41,13 @@ protected:
 
 	void UpdateStructuralState();
 
+	/** Hide the actor after DestroyDelay while retaining its level-instance
+	 *  configuration for mission resets. */
+	void SoftDespawn();
+
+	FTimerHandle DespawnTimerHandle;
+	bool bSoftDespawned = false;
+
 public:
 	UPROPERTY(VisibleAnywhere, Category = "Health")
 	float CurrentHealth;
@@ -56,16 +63,13 @@ public:
 	FString GetReadableName() const;
 	void SetHighlightEnabled(bool bEnabled);
 
-	/** Restore this target to full health and the Intact state.
-	 *
-	 *  Cancels any despawn already scheduled by DestroyDelay, so a target can be
-	 *  brought back during the seconds between "destroyed" and "gone". Broadcasts
-	 *  OnStructuralStateChanged only on a real transition, which is what puts the
-	 *  mesh, collision and ticking back (see ATargetActor).
-	 *
-	 *  Safe to call on an undamaged target: it becomes a no-op. */
+	/** Restore full health and the Intact state. Cancels pending despawn and
+	 *  broadcasts only when the structural state changes. */
 	UFUNCTION(BlueprintCallable, Category = "Damage")
 	void Revive();
+
+	/** Cancel the pending despawn timer. */
+	void CancelPendingDespawn();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Damage")
 	EStructuralState StructuralState = EStructuralState::Intact;
@@ -76,9 +80,8 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Damage")
 	float DestroyedThreshold = 0.25f;
 
-	/** Seconds between entering the Destroyed state and the owning actor being despawned.
-	 *  Set to 0 to keep the actor alive forever (the user is responsible for cleanup).
-	 *  Set to >0 to auto-destroy via SetLifeSpan after the destroyed-state visuals play. */
+	/** Seconds after destruction before the wreck is hidden and collision is disabled.
+	 *  Zero disables automatic hiding. The actor remains available for resets. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Damage",
 		meta = (ClampMin = "0.0"))
 	float DestroyDelay = 2.f;
@@ -89,7 +92,7 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Damage")
 	FOnDamageTaken OnDamageTaken;
 
-	/** Toggle debug logging for damage and structural state changes (editor only). */
+	/** Enable damage and structural-state diagnostics in editor builds. */
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	bool bShowDebug = false;
 };

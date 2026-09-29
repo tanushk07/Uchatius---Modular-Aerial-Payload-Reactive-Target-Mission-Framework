@@ -23,8 +23,8 @@ void UMovableTargetComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Captured before the early-out below, so even a vehicle that never ticks
-	// still knows where home is.
+	// Capture the reset transform before the early return so stationary vehicles
+	// retain their starting position.
 	if (GetOwner())
 	{
 		StartTransform = GetOwner()->GetActorTransform();
@@ -218,9 +218,8 @@ void UMovableTargetComponent::MoveAlongSpline(float DeltaTime)
 		float NewInputKey = PatrolSpline->FindInputKeyClosestToWorldLocation(CurrentLoc);
 		DistanceAlongSpline = PatrolSpline->GetDistanceAlongSplineAtSplineInputKey(NewInputKey);
 
-		// Aim at a point AHEAD along the path, not the nearest point. The
-		// nearest point sits perpendicular to the vehicle, and anything with a
-		// finite turning radius can never drive onto it - it just weaves.
+		// Aim ahead along the path. Steering toward the nearest point can cause
+		// oscillation when the vehicle cannot turn sharply enough to reach it.
 		float AimDistance = DistanceAlongSpline + GetLookaheadDistance();
 		if (PatrolSpline->IsClosedLoop() && SplineLength > KINDA_SMALL_NUMBER)
 		{
@@ -234,7 +233,7 @@ void UMovableTargetComponent::MoveAlongSpline(float DeltaTime)
 		FVector SplineTarget = PatrolSpline->GetLocationAtDistanceAlongSpline(
 			AimDistance, ESplineCoordinateSpace::World);
 
-		// Ramp up while closing on the path rather than launching at full speed.
+		// Increase speed gradually while joining the path.
 		const float JoinRate = (Speed > CurrentSpeed) ? GetAccelRate() : GetBrakeRate();
 		CurrentSpeed = FMath::FInterpConstantTo(CurrentSpeed, Speed, DeltaTime, JoinRate);
 
@@ -260,10 +259,8 @@ void UMovableTargetComponent::MoveAlongSpline(float DeltaTime)
 		return;
 	}
 
-	// On an OPEN path the end of the spline is a destination, not a wrap point.
-	// Limit speed by what can still be braked to a halt in the distance that
-	// remains, so the vehicle rolls to a stop at B instead of running into it
-	// and clamping dead. This is the behaviour the A-to-B demo is showing off.
+	// On an open spline, the endpoint is a destination. Limit speed to the
+	// available braking distance so the vehicle stops at the endpoint.
 	float DesiredCruise = Speed;
 	if (!PatrolSpline->IsClosedLoop())
 	{
@@ -276,9 +273,7 @@ void UMovableTargetComponent::MoveAlongSpline(float DeltaTime)
 
 	DistanceAlongSpline += CurrentSpeed * DeltaTime;
 
-	// For closed-loop splines (the natural "patrol" case), wrap to the start
-	// instead of stopping at the end. Open splines keep the original clamp
-	// behavior so existing single-traversal setups are unchanged.
+	// Closed splines loop; open splines clamp at the endpoint.
 	if (PatrolSpline->IsClosedLoop())
 	{
 		DistanceAlongSpline = FMath::Fmod(DistanceAlongSpline, SplineLength);
@@ -292,7 +287,7 @@ void UMovableTargetComponent::MoveAlongSpline(float DeltaTime)
 		DistanceAlongSpline, ESplineCoordinateSpace::World
 	);
 
-	// Ease onto the path over ~0.3s so capture is not a visible teleport.
+	// Blend onto the path over approximately 0.3 seconds to avoid snapping.
 	if (SplineBlendAlpha < 1.f)
 	{
 		SplineBlendAlpha = FMath::Clamp(SplineBlendAlpha + DeltaTime / 0.3f, 0.f, 1.f);
@@ -416,7 +411,7 @@ void UMovableTargetComponent::UpdatePatrolMovement(float DeltaTime, float Speed)
 		LastDistanceToTarget = Distance;
 	}
 
-	// Ease into the waypoint instead of driving flat out and stopping dead.
+	// Reduce speed while approaching the waypoint.
 	const float ApproachLimit = GetApproachSpeedLimit(Distance - GetArrivalTolerance());
 	const float DesiredSpeed = FMath::Min(Speed, ApproachLimit);
 	const float Rate = (DesiredSpeed > CurrentSpeed) ? GetAccelRate() : GetBrakeRate();
@@ -450,10 +445,8 @@ void UMovableTargetComponent::MoveInConvoy(float DeltaTime)
 
 	float SplineLength = RootSpline->GetSplineLength();
 
-	// A convoy cannot hold a gap longer than the route it is driving. Without
-	// this, a short loop wraps every follower back onto the leader's own
-	// position - they end up occupying the same point and grinding together.
-	// Packing tighter is the graceful failure; stacking is not.
+	// Limit the following gap to the route length. On short loops, a larger gap
+	// can wrap followers onto the leader.
 	if (SplineLength > KINDA_SMALL_NUMBER)
 	{
 		CumulativeDistance = FMath::Min(CumulativeDistance, SplineLength * 0.8f);
@@ -462,9 +455,8 @@ void UMovableTargetComponent::MoveInConvoy(float DeltaTime)
 	float DesiredDistance = RootSplineDistance - CumulativeDistance;
 	const bool bLoop = RootSpline->IsClosedLoop() && SplineLength > KINDA_SMALL_NUMBER;
 
-	// On a closed loop the follower must wrap around the seam. Clamping to 0
-	// (the old behaviour) commanded it to the spline START every lap, which
-	// collapsed the gap and slammed the controller once per revolution.
+	// Wrap the follower distance across the loop seam instead of clamping it to
+	// zero, which would send it to the spline start on each lap.
 	if (bLoop)
 	{
 		DesiredDistance = FMath::Fmod(DesiredDistance, SplineLength);
@@ -478,18 +470,15 @@ void UMovableTargetComponent::MoveInConvoy(float DeltaTime)
 		DesiredDistance = FMath::Clamp(DesiredDistance, 0.f, SplineLength);
 	}
 
-	// Leader spline-speed feedforward. Derived from change in RootSplineDistance
-	// per tick so the follower matches the leader's actual velocity along the
-	// path (including 0 when the leader stops). Without this the controller
-	// implicitly assumes the leader is always moving at BaseSpeed and overshoots
-	// whenever the leader is slower or stopped.
+	// Measure the leader's actual speed along the spline. Using BaseSpeed here
+	// causes followers to overshoot when the leader slows or stops.
 	float LeaderSplineSpeed = 0.f;
 	if (bConvoyInitialized)
 	{
 		float Delta = RootSplineDistance - PrevRootSplineDistance;
 
-		// Unwrap the seam crossing, otherwise Delta is a full -SplineLength
-		// spike for one frame and the follower brakes hard every lap.
+		// Adjust for seam crossings to avoid a one-frame negative speed spike
+		// that would trigger hard braking.
 		if (bLoop)
 		{
 			if (Delta > SplineLength * 0.5f)
@@ -519,8 +508,7 @@ bool UMovableTargetComponent::FindRootSpline(USplineComponent*& OutSpline, float
 {
 	UMovableTargetComponent* Current = ConvoyLeader->FindComponentByClass<UMovableTargetComponent>();
 
-	// Visited-set guard: if a designer accidentally wires a circular convoy
-	// chain (A→B→A), this loop would otherwise spin forever and hang the game.
+	// Use a visited set to prevent infinite traversal of circular convoy chains.
 	TSet<const UMovableTargetComponent*> Visited;
 
 	while (Current)
@@ -564,8 +552,7 @@ float UMovableTargetComponent::CalculateCumulativeFollowDistance() const
 	float Total = 0.f;
 	const UMovableTargetComponent* Current = this;
 
-	// Visited-set guard against circular ConvoyLeader chains. Without it a
-	// pathological setup hangs the entire game thread on every tick.
+	// Prevent traversal of circular convoy chains.
 	TSet<const UMovableTargetComponent*> Visited;
 
 	while (Current && Current->MovementMode == ETargetMovementMode::ConvoyFollow)
@@ -673,7 +660,7 @@ void UMovableTargetComponent::UpdateConvoyMovement(float DeltaTime, USplineCompo
 
 	float DistanceGap = DesiredDistance - ConvoyDistanceAlongSpline;
 
-	// Take the shortest way round the loop rather than the long way back.
+	// Use the shortest path around the loop.
 	if (bLoopPath)
 	{
 		if (DistanceGap > SplineLength * 0.5f)
@@ -689,9 +676,7 @@ void UMovableTargetComponent::UpdateConvoyMovement(float DeltaTime, USplineCompo
 	const float FollowDist = GetFollowDistance();
 	float ClampedGap = FMath::Clamp(DistanceGap, -FollowDist, FollowDist);
 
-	// Derivative term on the gap error. Proportional-only control against a
-	// saturating speed clamp produces a limit cycle - the follower swings
-	// either side of its target gap forever instead of settling.
+	// The derivative term damps oscillation around the target gap.
 	float GapRate = 0.f;
 	if (bGapErrorInitialized)
 	{
@@ -700,37 +685,31 @@ void UMovableTargetComponent::UpdateConvoyMovement(float DeltaTime, USplineCompo
 	PrevGapError = ClampedGap;
 	bGapErrorInitialized = true;
 
-	// Velocity feedforward + P-controller on position error. At gap=0 with a
-	// stopped leader, TargetSpeed=0 — the controller itself decides to stop,
-	// instead of relying on the spline clamp to absorb a Speed-magnitude
-	// command every tick.
+	// Match the leader's speed and apply a proportional correction for the gap.
+	// When the leader stops and the gap is correct, the target speed is zero.
 	const float MaxSpeed = Speed * ConvoyMaxSpeedMultiplier;
 
-	// Cap the gain to the authority we actually have. A proportional term big
-	// enough to exceed the speed ceiling turns the loop into a bang-bang
-	// oscillator; sized this way the correction can never saturate.
+	// Limit the gain to available speed headroom to avoid saturation and
+	// oscillation.
 	const float Headroom = FMath::Max(MaxSpeed - FMath::Abs(LeaderSplineSpeed), 1.f);
 	const float EffectiveKp = FMath::Min(ConvoyFollowStiffness,
 		Headroom / FMath::Max(FollowDist, 1.f));
 
-	// Close the gap no faster than can be braked out of. Far back it presses
-	// on, near the mark it eases in, and it never over-runs - which is what
-	// reads as a driver judging a distance rather than a servo chasing a number.
+	// Limit gap-closing speed by braking distance so the follower slows as it
+	// approaches the target gap.
 	const float ApproachCap = GetApproachSpeedLimit(FMath::Abs(ClampedGap));
 	float Correction = FMath::Sign(ClampedGap)
 		* FMath::Min(FMath::Abs(ClampedGap) * EffectiveKp, ApproachCap);
 
-	// Residual damping to settle the last of the jitter.
+	// Apply additional damping to reduce residual jitter.
 	Correction += GapRate * ConvoyDamping;
 
-	// Guard the lower bound: if the leader is reversing, LeaderSplineSpeed is
-	// negative and a naive -(Leader + Recovery) would flip above Headroom,
-	// giving FMath::Clamp a min greater than its max.
+	// Keep the clamp bounds valid when the leader is reversing and its speed is
+	// negative.
 	const float DownAuthority = FMath::Max(LeaderSplineSpeed + ConvoyRecoverySpeed, 1.f);
 	Correction = FMath::Clamp(Correction, -DownAuthority, Headroom);
 
-	// Lower bound is negative so a follower that has closed up too far can
-	// ease back, instead of clamping at zero and waiting for the leader.
+	// Allow negative correction so a follower can increase the gap when too close.
 	const float DesiredSpeed = FMath::Clamp(
 		LeaderSplineSpeed + Correction,
 		-ConvoyRecoverySpeed,
@@ -742,9 +721,8 @@ void UMovableTargetComponent::UpdateConvoyMovement(float DeltaTime, USplineCompo
 
 	const float TargetSpeed = CurrentSpeed;
 
-	// Apply the forward-clearance brake (was computed every frame above but
-	// previously unused — defends against running into anything in front
-	// that isn't reflected in the spline math, e.g. a stopped non-leader).
+	// Apply forward-clearance braking to avoid collisions with actors not
+	// represented by the spline spacing.
 	ConvoyDistanceAlongSpline += TargetSpeed * CollisionBrake * DeltaTime;
 
 	if (bLoopPath)
@@ -805,9 +783,8 @@ float UMovableTargetComponent::GetForwardClearance()
 	FCollisionQueryParams Params;
 	Params.AddIgnoredActor(OwnerActor);
 
-	// Refresh the cached follower list at most once every
-	// ConvoyFollowerCacheRefreshSeconds seconds. Previously this walked the
-	// full world-actor list every frame per follower (O(N*M) total).
+	// Refresh the follower list at the configured interval instead of scanning
+	// every world actor for each follower on every frame.
 	const float Now = World->GetTimeSeconds();
 	if (Now >= CachedConvoyFollowersValidUntil)
 	{
@@ -876,9 +853,8 @@ void UMovableTargetComponent::RefreshDerivedGeometry()
 	ResolvedAxleOffset       = ResolvedVehicleLength * AxleOffsetInLengths;
 }
 
-/* Each accessor falls back to the hand-authored absolute value when the
- * override is set, or when geometry has not been resolved yet (component
- * queried before BeginPlay). */
+/** Return the configured value when overridden or before mesh geometry is
+ *  available. */
 
 float UMovableTargetComponent::GetFollowDistance() const
 {
@@ -956,9 +932,7 @@ void UMovableTargetComponent::ResetToStart()
 	if (!Owner)
 		return;
 
-	// TeleportPhysics so a simulating body is moved rather than swept - a sweep
-	// from wherever the vehicle died back to the start line would collide with
-	// everything in between.
+	// Use TeleportPhysics to avoid swept collisions while restoring the actor.
 	Owner->SetActorTransform(StartTransform, false, nullptr, ETeleportType::TeleportPhysics);
 
 	// --- path progress ---
@@ -976,8 +950,7 @@ void UMovableTargetComponent::ResetToStart()
 	OrbitTimer = 0.f;
 	LastDistanceToTarget = 0.f;
 
-	// --- controllers: leaving these primed would make the first frame after a
-	//     reset act on an error measured before it ---
+	// Reset controller history to avoid applying stale errors on the next tick.
 	CurrentSpeed = 0.f;
 	PrevGapError = 0.f;
 	bGapErrorInitialized = false;
@@ -989,12 +962,12 @@ void UMovableTargetComponent::ResetToStart()
 	bZInitialized = false;
 	DesiredMovementYaw = StartTransform.Rotator().Yaw;
 
-	// Follower cache is keyed on time; invalidate so the convoy is rediscovered.
+	// Force the follower list to be rebuilt.
 	CachedConvoyFollowersValidUntil = -1.f;
 
 	SetComponentTickEnabled(true);
 
-	// Re-derive the entry point on the path from the restored transform.
+	// Recalculate the actor's position along the path.
 	if (PatrolSpline)
 	{
 		InitializeSplineMovement();
@@ -1090,10 +1063,8 @@ void UMovableTargetComponent::AlignToGround(float DeltaTime)
 	const FRotator CurrentRot = OwnerActor->GetActorRotation();
 	const float SmoothedYaw = FMath::FixedTurn(CurrentRot.Yaw, DesiredMovementYaw, YawTurnSpeed * DeltaTime);
 
-	// ATargetActor uses its GroundFrame child to absorb pitch/roll, so the
-	// root takes a pure yaw rotation. For any other owner there is no
-	// GroundFrame to compensate, so zeroing pitch/roll on the root would make
-	// the actor sit flat on slopes — preserve incoming pitch/roll instead.
+	// TargetActors tilt their GroundFrame child for slopes, so the root needs
+	// only yaw. Preserve pitch and roll for actors without a GroundFrame.
 	if (Cast<ATargetActor>(OwnerActor))
 	{
 		OwnerActor->SetActorRotation(FRotator(0.f, SmoothedYaw, 0.f));
@@ -1123,12 +1094,8 @@ bool UMovableTargetComponent::TraceGround(const FVector& Origin, const FVector& 
 	FCollisionQueryParams Params;
 	Params.AddIgnoredActor(GetOwner());
 
-	// Query by OBJECT TYPE, not by channel. A by-channel trace on
-	// ECC_WorldStatic still hits WorldDynamic bodies, because they block that
-	// channel - so every vehicle's ground probe was landing on its neighbour's
-	// roof and conforming to it. Each then lifted the other, frame after
-	// frame, and the convoy climbed into a pile. Restricting the query to
-	// WorldStatic objects means only real ground can answer it.
+	// Trace by object type so only ground is considered. A WorldStatic channel
+	// trace can also hit WorldDynamic actors and cause vehicles to stack.
 	FCollisionObjectQueryParams ObjectParams;
 	ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
 
@@ -1189,8 +1156,7 @@ void UMovableTargetComponent::HandleBehaviorUpdated(float NewSpeedMultiplier, bo
 
 USplineComponent* UMovableTargetComponent::ResolveActiveSpline() const
 {
-	// Iterative walk with visited-set so a circular ConvoyLeader chain does
-	// not stack-overflow this previously-recursive resolver.
+	// Use iterative traversal with a visited set to guard against cycles.
 	const UMovableTargetComponent* Current = this;
 	TSet<const UMovableTargetComponent*> Visited;
 
