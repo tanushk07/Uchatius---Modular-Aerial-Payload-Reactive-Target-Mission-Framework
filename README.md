@@ -1,6 +1,8 @@
-# DynamicPayloadSystem — Unreal Engine 5 Plugin
+# Uchatius: Modular Aerial Payload, Reactive Target & Mission Framework
 
-A modular C++ plugin for **payload delivery, radial damage, AI convoy movement, and mission management** in Unreal Engine 5.
+> **License:** This source is public for reference only. Using the plugin in any project requires a license from [Fab](https://www.fab.com/listings/0cd7f808-edce-4b20-a105-ea1a9cc77572) (the Personal tier is free). Cloning this repository does not grant a license. See [LICENSE](LICENSE).
+
+A modular C++ plugin for **payload delivery, radial damage, AI convoy movement, and mission management** in Unreal Engine 5. Payloads can be explosive or non-explosive. The plugin and module keep the internal name `DynamicPayloadSystem` so existing projects don't break.
 
 Built for drone simulations, aerial strike games, and any project that needs physics-based bombing, AI vehicle convoys, and timed objective missions.
 
@@ -477,4 +479,6 @@ Core, CoreUObject, Engine, Niagara, PhysicsCore
 
 ## License
 
-Licensed under the Fab License Agreement.
+Copyright (c) 2026 Tanushk Nirmal. All rights reserved.
+
+Licensed under the [Fab End User License Agreement](https://www.fab.com/eula). A license is obtained only through the [Fab listing](https://www.fab.com/listings/0cd7f808-edce-4b20-a105-ea1a9cc77572). Cloning or forking this repository does not grant one. See [LICENSE](LICENSE).
